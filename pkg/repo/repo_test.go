@@ -117,3 +117,43 @@ func TestCreateAndList(t *testing.T) {
 		t.Errorf("unexpected listing: %+v", repos)
 	}
 }
+
+func TestRemoveBare(t *testing.T) {
+	root := t.TempDir()
+	dir, err := (Repo{Org: "acme", Name: "app"}).Dir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sibling, err := (Repo{Org: "acme", Name: "other"}).Dir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{dir, sibling} {
+		if IsBare(d) {
+			t.Fatalf("%s should not be bare before creation", d)
+		}
+		if err := CreateBare(d); err != nil {
+			t.Fatal(err)
+		}
+		if !IsBare(d) {
+			t.Fatalf("%s should be bare", d)
+		}
+	}
+
+	if err := RemoveBare(root, dir); err != nil {
+		t.Fatal(err)
+	}
+	if Exists(dir) {
+		t.Error("removed repo still exists")
+	}
+	if !Exists(sibling) {
+		t.Error("sibling repo was removed")
+	}
+	repos, err := List(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 1 || repos[0].String() != "acme/other.git" {
+		t.Errorf("unexpected listing after removal: %+v", repos)
+	}
+}

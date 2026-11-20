@@ -22,8 +22,8 @@ under `repo_root`.
   needs no external `git` binary.
 - `sh test/unit.sh` and `./test/e2e.sh` pass.
 
-Not implemented yet: repo deletion, repo listing, `server-access.git`, and an
-HTTP Git endpoint. See `BACKLOG.md` (local, git-ignored).
+Not implemented yet: repo listing, `server-access.git`, and an HTTP Git
+endpoint. See `BACKLOG.md` (local, git-ignored).
 
 ## Configuration
 
@@ -96,6 +96,35 @@ escaping `repo_root` are rejected.
 An `owner` pushing to a missing repo creates a bare repo with `HEAD` pointing
 at `refs/heads/main`. Other roles cannot create repos.
 
+### Deleting a repository
+
+An `owner` deletes a repository by pushing a deletion of its default branch,
+resolved from the repo's `HEAD` (not hardcoded to `main`):
+
+```sh
+git push origin :refs/heads/main
+```
+
+The first push is refused and names the exact retry, because the ref deletion
+would destroy every other ref with it. Confirm with the `confirm-delete` push
+option:
+
+```sh
+git push -o confirm-delete origin :refs/heads/main
+```
+
+The server advertises the `push-options` capability, so the client sends the
+option only when asked to. Only `owner` may delete; the push is refused for
+reserved names and for paths that are not bare repositories. After the ref
+update succeeds the directory is renamed into `<repo_root>/.trash/` and then
+removed, so a push either leaves the repo untouched or removes it completely.
+Deletion never touches `<org>.access`. A later owner push to the same path
+recreates the repo, empty, because creation-on-push is enabled.
+
+Deletion holds the per-repo lock, so a push and active clone/fetch sessions on
+the same repository do not overlap in-process. A client already connected to a
+repo that is deleted sees its session fail.
+
 ### Bootstrap
 
 An empty `repo_root` authenticates nobody. Before the first connection:
@@ -163,7 +192,10 @@ root, and Caddy data/cache directories, then asserts:
   fails;
 - a blocked handle cannot read;
 - a repo in an org without an ACL is unreadable;
-- traversal paths and shell commands are rejected.
+- traversal paths and shell commands are rejected;
+- deleting the default branch without `-o confirm-delete` is refused with the
+  retry command in the error, leaves the repo and branch intact, and the
+  confirmed push removes the repo while a sibling repo survives.
 
 It also checks that the image's Caddy version matches `go.mod`, that the
 shipped `www/Caddyfile` validates, and that deliberately broken Caddyfiles

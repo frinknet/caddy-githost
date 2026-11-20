@@ -121,7 +121,7 @@ func (s *Server) handleSession(sess ssh.Session) {
 		return
 	}
 
-	req := backend.Request{Repo: r, Dir: dir, Handle: handle, Role: role, GitProtocol: gitProtocolEnv(sess.Environ())}
+	req := backend.Request{Repo: r, Root: s.repoRoot, Dir: dir, Handle: handle, Role: role, GitProtocol: gitProtocolEnv(sess.Environ())}
 	switch action {
 	case actionUploadPack:
 		if !role.CanRead() {

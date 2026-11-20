@@ -5,10 +5,14 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 )
 
 var namePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+const trashDir = ".trash"
 
 type Repo struct {
 	Org  string
@@ -71,6 +75,32 @@ func (r Repo) Dir(root string) (string, error) {
 func Exists(dir string) bool {
 	info, err := os.Stat(dir)
 	return err == nil && info.IsDir()
+}
+
+func IsBare(dir string) bool {
+	info, err := os.Stat(filepath.Join(dir, "objects"))
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	_, err = os.Stat(filepath.Join(dir, "HEAD"))
+	return err == nil
+}
+
+func RemoveBare(root, dir string) error {
+	trash := filepath.Join(root, trashDir)
+	if err := os.MkdirAll(trash, 0o755); err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(root, dir)
+	if err != nil {
+		return err
+	}
+	name := strconv.FormatInt(time.Now().UnixNano(), 10) + "-" + strings.ReplaceAll(filepath.ToSlash(rel), "/", "-")
+	target := filepath.Join(trash, name)
+	if err := os.Rename(dir, target); err != nil {
+		return err
+	}
+	return os.RemoveAll(target)
 }
 
 func CreateBare(dir string) error {

@@ -161,4 +161,18 @@ if command -v ssh >/dev/null 2>&1; then
 	fi
 fi
 
+if GIT_SSH_COMMAND="$(ssh_for "$WORK/id_alice")" timeout 60s \
+	git -C "$WORK/clone" push -q origin :refs/heads/main 2>"$WORK/delete.out"; then
+	fail "unconfirmed default branch deletion succeeded"
+fi
+grep -q "confirm-delete" "$WORK/delete.out" || fail "rejection did not print the confirmation command"
+[ -d "$WORK/acme/app.git" ] || fail "unconfirmed deletion removed the repository"
+GIT_SSH_COMMAND="$(ssh_for "$WORK/id_alice")" timeout 30s git ls-remote "$URL" refs/heads/main |
+	grep -q . || fail "unconfirmed deletion removed the default branch"
+
+GIT_SSH_COMMAND="$(ssh_for "$WORK/id_alice")" timeout 60s \
+	git -C "$WORK/clone" push -q -o confirm-delete origin :refs/heads/main
+[ ! -e "$WORK/acme/app.git" ] || fail "confirmed deletion left the repository in place"
+[ -d "$WORK/other/secret.git" ] || fail "confirmed deletion removed a sibling repository"
+
 printf 'e2e: ok\n'

@@ -10,6 +10,7 @@ import (
 
 type Request struct {
 	Repo        repo.Repo
+	Root        string
 	Dir         string
 	Handle      string
 	Role        access.Role
