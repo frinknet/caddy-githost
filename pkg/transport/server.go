@@ -159,6 +159,7 @@ func (s *Server) handleSession(sess ssh.Session) {
 			s.fail(sess, "repository not found")
 			return
 		}
+		s.writeListingHint(sess, handle)
 		err = s.backend.UploadPack(sess.Context(), req, sess, sess, sess.Stderr())
 	case actionReceivePack:
 		if !role.CanPush() {
@@ -255,25 +256,49 @@ func isAdminPath(arg, configRepo string) bool {
 }
 
 func (s *Server) listRepositories(sess ssh.Session, handle string) {
-	repos, err := repo.List(s.repoRoot)
+	lines, err := s.repositoryListing(handle)
 	if err != nil {
 		s.fail(sess, "list repositories: "+err.Error())
 		return
 	}
-	sort.Slice(repos, func(i, j int) bool { return repos[i].String() < repos[j].String() })
-
-	snapshot := s.store.Snapshot()
-	for _, r := range repos {
-		role := snapshot.Role(r.Org, handle)
-		if !role.CanRead() {
-			continue
-		}
-		if _, err := fmt.Fprintf(sess, "%s  %s\n", r, role); err != nil {
+	for _, line := range lines {
+		if _, err := fmt.Fprintln(sess, line); err != nil {
 			s.fail(sess, "list repositories: "+err.Error())
 			return
 		}
 	}
 	_ = sess.Exit(0)
+}
+
+func (s *Server) writeListingHint(sess ssh.Session, handle string) {
+	lines, err := s.repositoryListing(handle)
+	if err != nil {
+		return
+	}
+	for _, line := range lines {
+		if _, err := fmt.Fprintln(sess.Stderr(), line); err != nil {
+			return
+		}
+	}
+}
+
+func (s *Server) repositoryListing(handle string) ([]string, error) {
+	repos, err := repo.List(s.repoRoot)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(repos, func(i, j int) bool { return repos[i].String() < repos[j].String() })
+
+	snapshot := s.store.Snapshot()
+	lines := make([]string, 0, len(repos))
+	for _, r := range repos {
+		role := snapshot.Role(r.Org, handle)
+		if !role.CanRead() {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s  %s", r, role))
+	}
+	return lines, nil
 }
 
 func (s *Server) fail(sess ssh.Session, msg string) {

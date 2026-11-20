@@ -179,6 +179,9 @@ func TestSSHUploadPack(t *testing.T) {
 	if stdout != "upload-ok" {
 		t.Errorf("stdout = %q", stdout)
 	}
+	if want := "acme/app.git  owner\n"; stderr != want {
+		t.Errorf("stderr = %q, want %q", stderr, want)
+	}
 	calls, req := fake.snapshot()
 	if calls != 1 {
 		t.Fatalf("backend calls = %d, want 1", calls)
@@ -199,6 +202,9 @@ func TestSSHReceivePack(t *testing.T) {
 	if stdout != "receive-ok" {
 		t.Errorf("stdout = %q", stdout)
 	}
+	if stderr != "" {
+		t.Errorf("stderr = %q, want empty", stderr)
+	}
 	calls, req := fake.snapshot()
 	if calls != 1 || req.Role != access.RoleCoder {
 		t.Errorf("unexpected backend call: calls=%d req=%+v", calls, req)
@@ -218,6 +224,19 @@ func TestSSHGuestCannotPush(t *testing.T) {
 	}
 	if calls, _ := fake.snapshot(); calls != 0 {
 		t.Errorf("backend called %d times", calls)
+	}
+}
+
+func TestSSHBlockedHandleGetsNoHint(t *testing.T) {
+	srv, _, _, clientSigner := startTestServer(t, "block", true)
+	client := dial(t, srv, clientSigner)
+
+	code, _, stderr := runCommand(t, client, `git-upload-pack 'acme/app.git'`)
+	if code == 0 {
+		t.Fatal("blocked handle read the repository")
+	}
+	if strings.Contains(stderr, "acme/") {
+		t.Errorf("denied session leaked the listing: %q", stderr)
 	}
 }
 
@@ -302,7 +321,15 @@ func TestSSHListRepositories(t *testing.T) {
 			t.Errorf("%q: stdout = %q, want %q", command, stdout, want)
 		}
 	}
-	if calls, _ := fake.snapshot(); calls != 0 {
-		t.Errorf("backend called %d times", calls)
+
+	code, _, stderr := runCommand(t, client, `git-upload-pack 'acme/tools.git'`)
+	if code != 0 {
+		t.Fatalf("upload-pack exit %d, stderr %q", code, stderr)
+	}
+	if stderr != want {
+		t.Errorf("upload-pack stderr = %q, want %q", stderr, want)
+	}
+	if calls, _ := fake.snapshot(); calls != 1 {
+		t.Errorf("backend calls = %d, want 1", calls)
 	}
 }

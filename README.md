@@ -18,6 +18,10 @@ under `repo_root`; the users file and org ACLs live in `config_dir`.
   and `githost-list` are accepted; a session with no command (and no PTY)
   prints the same listing. Shells, PTYs, port forwarding, agent forwarding,
   and SFTP are denied.
+- Before `upload-pack` starts, the readable repository listing is written to
+  the session's stderr as a best-effort hint, so `git clone` and `git fetch`
+  show it as remote output and `git ls-remote` prints it when the client has
+  not closed first.
 - Host key: an Ed25519 key. With `secret` it is deterministically derived from
   the secret and never stored; otherwise one key is persisted at
   `githost/ssh_host_ed25519` in Caddy storage, generated on first use and
@@ -164,8 +168,12 @@ acme/tools.git  owner
 
 The first column is the repo path and the second its role in that org. Repos
 are sorted by path. An org whose ACL gives the handle no read role, including
-`block`, contributes nothing, and the command still exits `0`. There is no Git
-protocol for listing repositories, so `git ls-remote` cannot advertise them.
+`block`, contributes nothing, and the command still exits `0`. Git has no
+protocol for listing repositories, so the same lines are written to the
+session's stderr before `upload-pack` starts: `git clone` and `git fetch`
+print them as remote output, and `git ls-remote` prints them when the client
+is still listening. The write is best effort and never changes stdout, the
+ref advertisement, or the exit code.
 
 ### Deleting a repository
 
@@ -268,6 +276,8 @@ root, a temporary config dir, and Caddy data/cache directories, then asserts:
 - a repo in an org without an ACL is unreadable;
 - `githost-list`, and a session with no command, print exactly the readable
   repos with each role's label, and nothing for a blocked handle;
+- a clone's stderr carries the same listing for the authenticated handle,
+  while a blocked handle's denied session leaks none of it;
 - traversal paths and shell commands are rejected;
 - a non-admin push to the config repository is denied; an admin push installs
   the ACLs and takes effect without a reload; adding a handle to the pushed

@@ -123,8 +123,18 @@ fi
 [ -z "$(find "$WORK/data" -name ssh_host_ed25519 -print -quit 2>/dev/null)" ] ||
 	fail "host key was stored despite secret"
 
-GIT_SSH_COMMAND="$(ssh_for "$WORK/id_alice")" timeout 60s git clone -q "$URL" "$WORK/clone"
+GIT_SSH_COMMAND="$(ssh_for "$WORK/id_alice")" timeout 60s git clone -q "$URL" "$WORK/clone" 2>"$WORK/clone.err"
 [ "$(cat "$WORK/clone/README")" = "hello githost" ] || fail "clone content mismatch"
+# The hint is best effort and git may prefix or reorder it, so match its lines
+# rather than the whole stderr stream.
+grep -q 'acme/app.git  owner' "$WORK/clone.err" || {
+	cat "$WORK/clone.err" >&2
+	fail "clone stderr did not carry the owner repository hint"
+}
+grep -q 'acme/tools.git  owner' "$WORK/clone.err" || {
+	cat "$WORK/clone.err" >&2
+	fail "clone stderr did not carry the sibling repository hint"
+}
 
 printf 'push from owner\n' >>"$WORK/clone/README"
 git -C "$WORK/clone" add README
@@ -150,9 +160,10 @@ if GIT_SSH_COMMAND="$(ssh_for "$WORK/id_carol")" timeout 60s git -C "$WORK/carol
 	fail "coder push to main succeeded"
 fi
 
-if GIT_SSH_COMMAND="$(ssh_for "$WORK/id_mallory")" timeout 30s git ls-remote "$URL" >/dev/null 2>&1; then
+if GIT_SSH_COMMAND="$(ssh_for "$WORK/id_mallory")" timeout 30s git ls-remote "$URL" >/dev/null 2>"$WORK/mallory.err"; then
 	fail "blocked handle read the repository"
 fi
+grep -q 'acme/app.git  ' "$WORK/mallory.err" && fail "blocked handle saw the repository hint"
 
 if GIT_SSH_COMMAND="$(ssh_for "$WORK/id_alice")" timeout 30s git ls-remote "ssh://git@127.0.0.1:$PORT/other/secret.git" >/dev/null 2>&1; then
 	fail "repository without an org ACL was readable"

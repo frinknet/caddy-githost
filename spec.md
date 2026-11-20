@@ -13,7 +13,8 @@ Implemented:
 - Per-org ACLs and role policy: owner, coder, guest, block.
 - Clone, fetch, push, repository creation on owner push, and confirmed
   repository deletion.
-- Repository listing over SSH with `githost-list`.
+- Repository listing over SSH with `githost-list` and a best-effort
+  `git ls-remote` hint on stderr.
 - A config repository, `server-access.git` by default, whose default branch is
   materialized into `config_dir` and reloaded in process.
 
@@ -21,7 +22,6 @@ Not implemented:
 
 - An HTTP Git endpoint. The backend is shared by design so an HTTP handler can
   be added without loopback calls or OS accounts.
-- A repository hint for `git ls-remote`. See `BACKLOG.md`.
 
 ## Goals and boundaries
 
@@ -153,6 +153,13 @@ acme/tools.git  guest
 The second column is the role in that org. Repos are sorted by path. Orgs the
 handle cannot read, including `block`, contribute nothing. The command exits
 `0` even when the listing is empty.
+
+Before `git-upload-pack` starts, the same lines are written to the session's
+stderr. The SSH client inherits that stream, so `git clone` and `git fetch`
+print the readable repositories among their remote output without changing
+stdout, the ref advertisement, or the exit code. Writing to stderr is best
+effort: a client that disconnects first sees nothing, and the write error is
+ignored. No fake refs are ever advertised.
 
 ### Deletion
 
@@ -290,10 +297,11 @@ SSH. Until it exists, the SSH transport is the only Git transport.
 
 ### `git ls-remote` listing hint
 
-A best-effort banner may be written to the session stderr after `upload-pack`
-so git prints the readable repositories as `remote:` lines. It must never emit
-fake refs, and the e2e assertion must tolerate its absence. See
-`BACKLOG.md` for the race and ordering constraints.
+The listing is written to the session stderr before `upload-pack` starts, so a
+client still waiting for the advertisement receives it and `git ls-remote`
+shows the readable repositories on stderr, before or after the refs. The write
+is best effort, its error is ignored, and its assertion tolerates an absent
+hint. It must never emit fake refs.
 
 ## Antipatterns
 
