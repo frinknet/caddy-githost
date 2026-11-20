@@ -63,6 +63,7 @@ type Snapshot struct {
 	users    []*User
 	byHandle map[string]*User
 	acls     map[string]map[string]Role
+	admins   map[string]struct{}
 }
 
 func (s *Snapshot) Authenticate(key gossh.PublicKey) (string, bool) {
@@ -75,6 +76,22 @@ func (s *Snapshot) Authenticate(key gossh.PublicKey) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func (s *Snapshot) HasHandle(handle string) bool {
+	if s == nil {
+		return false
+	}
+	_, ok := s.byHandle[handle]
+	return ok
+}
+
+func (s *Snapshot) IsAdmin(handle string) bool {
+	if s == nil {
+		return false
+	}
+	_, ok := s.admins[handle]
+	return ok
 }
 
 func (s *Snapshot) Role(org, handle string) Role {

@@ -208,6 +208,116 @@ func TestStoreFailClosed(t *testing.T) {
 	}
 }
 
+func TestParseFiles(t *testing.T) {
+	lineA, keyA := testUser(t, "@alice", "alice@example.com")
+	files := map[string][]byte{
+		"users":       []byte(lineA + "\n"),
+		"admins":      []byte("# keep this handle\n@alice\n"),
+		"acme.access": []byte("@alice owner\n"),
+	}
+
+	snap, err := ParseFiles(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handle, ok := snap.Authenticate(keyA); !ok || handle != "@alice" {
+		t.Errorf("Authenticate(alice) = %q, %v", handle, ok)
+	}
+	if snap.Role("acme", "@alice") != RoleOwner {
+		t.Errorf("alice role = %q, want owner", snap.Role("acme", "@alice"))
+	}
+	if !snap.HasHandle("@alice") || snap.HasHandle("@bob") {
+		t.Error("HasHandle mismatch")
+	}
+	if !snap.IsAdmin("@alice") || snap.IsAdmin("@bob") {
+		t.Error("IsAdmin mismatch")
+	}
+
+	if _, err := ParseFiles(map[string][]byte{
+		"users":       []byte(lineA + "\n"),
+		"acme.access": []byte("@nobody owner\n"),
+	}); err == nil {
+		t.Error("unknown handle must fail")
+	}
+	if _, err := ParseFiles(map[string][]byte{"notes.txt": []byte("x")}); err == nil {
+		t.Error("unexpected file must fail")
+	}
+	if _, err := ParseFiles(map[string][]byte{
+		"users":  []byte(lineA + "\n"),
+		"admins": []byte("@nobody\n"),
+	}); err == nil {
+		t.Error("unknown admin handle must fail")
+	}
+}
+
+func TestStoreApply(t *testing.T) {
+	root := t.TempDir()
+	lineA, _ := testUser(t, "@alice", "alice@example.com")
+	if err := os.WriteFile(filepath.Join(root, "users"), []byte(lineA+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "acme.access"), []byte("@alice guest\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "old.access"), []byte("@alice guest\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "admins"), []byte("@alice\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.Snapshot().CanPush("acme", "@alice") {
+		t.Fatal("alice should not push yet")
+	}
+
+	files := map[string][]byte{
+		"users":       []byte(lineA + "\n"),
+		"admins":      []byte("@alice\n"),
+		"acme.access": []byte("@alice owner\n"),
+	}
+	if err := store.Apply(files); err != nil {
+		t.Fatal(err)
+	}
+	if !store.Snapshot().CanPush("acme", "@alice") {
+		t.Error("alice should push after apply")
+	}
+	if !store.Snapshot().IsAdmin("@alice") {
+		t.Error("alice should be admin after apply")
+	}
+	if _, err := os.Stat(filepath.Join(root, "old.access")); !os.IsNotExist(err) {
+		t.Error("stale old.access was not removed")
+	}
+	data, err := os.ReadFile(filepath.Join(root, "acme.access"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "@alice owner\n" {
+		t.Errorf("acme.access = %q", data)
+	}
+
+	bad := map[string][]byte{
+		"users":       []byte(lineA + "\n"),
+		"acme.access": []byte("@nobody owner\n"),
+	}
+	if err := store.Apply(bad); err == nil {
+		t.Fatal("expected apply error")
+	}
+	if !store.Snapshot().CanPush("acme", "@alice") {
+		t.Error("failed apply must keep the previous snapshot")
+	}
+	data, err = os.ReadFile(filepath.Join(root, "acme.access"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "@alice owner\n" {
+		t.Errorf("failed apply changed acme.access to %q", data)
+	}
+}
+
 func TestStoreRejectsUnknownACLHandle(t *testing.T) {
 	root := t.TempDir()
 	lineA, _ := testUser(t, "@alice", "alice@example.com")

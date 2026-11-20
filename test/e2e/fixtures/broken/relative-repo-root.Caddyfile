@@ -1,5 +1,5 @@
 {
-	gitproxy {
+	githost {
 		repo_root relative/repos
 	}
 }

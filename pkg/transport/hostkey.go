@@ -8,8 +8,21 @@ import (
 	"fmt"
 
 	"github.com/caddyserver/certmagic"
+	"golang.org/x/crypto/scrypt"
 	"golang.org/x/crypto/ssh"
 )
+
+func HostKeyFromPhrase(phrase string) (ssh.Signer, error) {
+	seed, err := scrypt.Key([]byte(phrase), []byte("caddy-githost/ssh-host-key/v1"), 32768, 8, 1, ed25519.SeedSize)
+	if err != nil {
+		return nil, fmt.Errorf("derive ssh host key: %w", err)
+	}
+	signer, err := ssh.NewSignerFromKey(ed25519.NewKeyFromSeed(seed))
+	if err != nil {
+		return nil, fmt.Errorf("host key signer: %w", err)
+	}
+	return signer, nil
+}
 
 func LoadOrCreateHostKey(ctx context.Context, storage certmagic.Storage, keyPath string) (ssh.Signer, error) {
 	if storage.Exists(ctx, keyPath) {
@@ -28,7 +41,7 @@ func LoadOrCreateHostKey(ctx context.Context, storage certmagic.Storage, keyPath
 	if err != nil {
 		return nil, fmt.Errorf("generate ed25519 host key: %w", err)
 	}
-	block, err := ssh.MarshalPrivateKey(priv, "gitproxy-host-key")
+	block, err := ssh.MarshalPrivateKey(priv, "githost-host-key")
 	if err != nil {
 		return nil, fmt.Errorf("marshal ssh host key: %w", err)
 	}

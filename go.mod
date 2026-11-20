@@ -1,4 +1,4 @@
-module github.com/frinknet/caddy-gitproxy
+module github.com/frinknet/caddy-githost
 
 go 1.26.0
 

@@ -1,7 +1,7 @@
 {
-	gitproxy {
+	githost {
 		listen_addr :22
-		repo_root /var/lib/gitproxy/repos
+		repo_root /var/lib/githost/repos
 	}
 }
 

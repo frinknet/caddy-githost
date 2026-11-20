@@ -1,0 +1,9 @@
+{
+	githost {
+		config_dir relative/config
+	}
+}
+
+:8080 {
+	respond "broken" 200
+}

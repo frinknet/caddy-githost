@@ -9,10 +9,12 @@ import (
 )
 
 func TestUnmarshalCaddyfile(t *testing.T) {
-	d := caddyfile.NewTestDispenser(`gitproxy {
+	d := caddyfile.NewTestDispenser(`githost {
 		listen_addr :2222
 		repo_root /srv/git
-		host_key_path keys/ssh_host_ed25519
+		config_dir /srv/config
+		config_repo acme-config.git
+		secret correct horse battery staple
 	}`)
 
 	var cfg Config
@@ -26,13 +28,19 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 	if cfg.RepoRoot != "/srv/git" {
 		t.Errorf("repo_root = %q, want %q", cfg.RepoRoot, "/srv/git")
 	}
-	if cfg.HostKeyPath != "keys/ssh_host_ed25519" {
-		t.Errorf("host_key_path = %q, want %q", cfg.HostKeyPath, "keys/ssh_host_ed25519")
+	if cfg.ConfigDir != "/srv/config" {
+		t.Errorf("config_dir = %q, want %q", cfg.ConfigDir, "/srv/config")
+	}
+	if cfg.ConfigRepo != "acme-config.git" {
+		t.Errorf("config_repo = %q, want %q", cfg.ConfigRepo, "acme-config.git")
+	}
+	if cfg.Secret != "correct horse battery staple" {
+		t.Errorf("secret = %q", cfg.Secret)
 	}
 }
 
 func TestUnmarshalCaddyfileRejectsUnknown(t *testing.T) {
-	d := caddyfile.NewTestDispenser(`gitproxy {
+	d := caddyfile.NewTestDispenser(`githost {
 		users_file /srv/git/users
 	}`)
 
@@ -43,7 +51,7 @@ func TestUnmarshalCaddyfileRejectsUnknown(t *testing.T) {
 }
 
 func TestUnmarshalCaddyfileRejectsExtraArgs(t *testing.T) {
-	d := caddyfile.NewTestDispenser(`gitproxy unexpected`)
+	d := caddyfile.NewTestDispenser(`githost unexpected`)
 
 	var cfg Config
 	if err := cfg.UnmarshalCaddyfile(d); err == nil {
@@ -52,7 +60,7 @@ func TestUnmarshalCaddyfileRejectsExtraArgs(t *testing.T) {
 }
 
 func TestParseGlobalOption(t *testing.T) {
-	d := caddyfile.NewTestDispenser(`gitproxy {
+	d := caddyfile.NewTestDispenser(`githost {
 		listen_addr :2222
 	}`)
 
@@ -65,8 +73,8 @@ func TestParseGlobalOption(t *testing.T) {
 	if !ok {
 		t.Fatalf("global option returned %T, want httpcaddyfile.App", val)
 	}
-	if app.Name != "gitproxy" {
-		t.Errorf("app name = %q, want %q", app.Name, "gitproxy")
+	if app.Name != "githost" {
+		t.Errorf("app name = %q, want %q", app.Name, "githost")
 	}
 
 	var cfg Config
@@ -80,12 +88,50 @@ func TestParseGlobalOption(t *testing.T) {
 
 func TestValidateRejectsRelativeRepoRoot(t *testing.T) {
 	cfg := Config{
-		ListenAddr:  ":22",
-		RepoRoot:    "repos",
-		HostKeyPath: DefaultHostKeyPath,
+		ListenAddr: ":22",
+		RepoRoot:   "repos",
+		ConfigDir:  DefaultConfigDir,
 	}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error for relative repo_root")
+	}
+}
+
+func TestValidateRejectsBlankSecret(t *testing.T) {
+	cfg := Config{
+		ListenAddr: ":22",
+		RepoRoot:   DefaultRepoRoot,
+		ConfigDir:  DefaultConfigDir,
+		ConfigRepo: DefaultConfigRepo,
+		Secret:     "   ",
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for blank secret")
+	}
+}
+
+func TestValidateConfigRepo(t *testing.T) {
+	for _, repo := range []string{"infra/config.git", "../x.git", ".git", "server-access"} {
+		cfg := Config{
+			ListenAddr: ":22",
+			RepoRoot:   DefaultRepoRoot,
+			ConfigDir:  DefaultConfigDir,
+			ConfigRepo: repo,
+		}
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("config_repo %q should fail validation", repo)
+		}
+	}
+}
+
+func TestValidateRejectsRelativeConfigDir(t *testing.T) {
+	cfg := Config{
+		ListenAddr: ":22",
+		RepoRoot:   DefaultRepoRoot,
+		ConfigDir:  "config",
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for relative config_dir")
 	}
 }
 
@@ -99,7 +145,10 @@ func TestApplyDefaults(t *testing.T) {
 	if cfg.RepoRoot != DefaultRepoRoot {
 		t.Errorf("repo_root = %q, want %q", cfg.RepoRoot, DefaultRepoRoot)
 	}
-	if cfg.HostKeyPath != DefaultHostKeyPath {
-		t.Errorf("host_key_path = %q, want %q", cfg.HostKeyPath, DefaultHostKeyPath)
+	if cfg.ConfigDir != DefaultConfigDir {
+		t.Errorf("config_dir = %q, want %q", cfg.ConfigDir, DefaultConfigDir)
+	}
+	if cfg.ConfigRepo != DefaultConfigRepo {
+		t.Errorf("config_repo = %q, want %q", cfg.ConfigRepo, DefaultConfigRepo)
 	}
 }

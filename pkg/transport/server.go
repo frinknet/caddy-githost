@@ -4,23 +4,28 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 
-	"github.com/frinknet/caddy-gitproxy/pkg/access"
-	"github.com/frinknet/caddy-gitproxy/pkg/backend"
-	"github.com/frinknet/caddy-gitproxy/pkg/repo"
+	"github.com/frinknet/caddy-githost/pkg/access"
+	"github.com/frinknet/caddy-githost/pkg/backend"
+	"github.com/frinknet/caddy-githost/pkg/repo"
 	"github.com/gliderlabs/ssh"
 	"go.uber.org/zap"
 	gossh "golang.org/x/crypto/ssh"
 )
 
-const handleKey = "gitproxy.handle"
+const (
+	handleKey         = "githost.handle"
+	defaultConfigRepo = "server-access.git"
+)
 
 type Options struct {
 	ListenAddr string
 	RepoRoot   string
+	ConfigRepo string
 	Store      *access.Store
 	Backend    backend.Backend
 	HostKey    gossh.Signer
@@ -28,23 +33,29 @@ type Options struct {
 }
 
 type Server struct {
-	addr     string
-	repoRoot string
-	store    *access.Store
-	backend  backend.Backend
-	logger   *zap.Logger
-	srv      *ssh.Server
-	ln       net.Listener
-	wg       sync.WaitGroup
+	addr       string
+	repoRoot   string
+	configRepo string
+	store      *access.Store
+	backend    backend.Backend
+	logger     *zap.Logger
+	srv        *ssh.Server
+	ln         net.Listener
+	wg         sync.WaitGroup
 }
 
 func NewServer(opts Options) *Server {
+	configRepo := opts.ConfigRepo
+	if configRepo == "" {
+		configRepo = defaultConfigRepo
+	}
 	s := &Server{
-		addr:     opts.ListenAddr,
-		repoRoot: opts.RepoRoot,
-		store:    opts.Store,
-		backend:  opts.Backend,
-		logger:   opts.Logger,
+		addr:       opts.ListenAddr,
+		repoRoot:   opts.RepoRoot,
+		configRepo: configRepo,
+		store:      opts.Store,
+		backend:    opts.Backend,
+		logger:     opts.Logger,
 	}
 	s.srv = &ssh.Server{
 		Addr:             opts.ListenAddr,
@@ -61,7 +72,7 @@ func NewServer(opts Options) *Server {
 func (s *Server) Start() error {
 	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
-		return fmt.Errorf("gitproxy: listen %s: %w", s.addr, err)
+		return fmt.Errorf("githost: listen %s: %w", s.addr, err)
 	}
 	s.ln = ln
 
@@ -69,7 +80,7 @@ func (s *Server) Start() error {
 	go func() {
 		defer s.wg.Done()
 		if err := s.srv.Serve(ln); err != nil && !errors.Is(err, ssh.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
-			s.logError("gitproxy ssh server stopped", err)
+			s.logError("githost ssh server stopped", err)
 		}
 	}()
 	return nil
@@ -109,12 +120,22 @@ func (s *Server) handleSession(sess ssh.Session) {
 		return
 	}
 
-	if args := sess.Command(); len(args) == 0 || (len(args) == 1 && args[0] == "gitproxy-list") {
+	args := sess.Command()
+	if len(args) == 0 || (len(args) == 1 && args[0] == "githost-list") {
 		s.listRepositories(sess, handle)
 		return
 	}
 
-	action, r, err := parseGitCommand(sess.Command())
+	if action, ok, err := parseAdminCommand(args, s.configRepo); ok {
+		if err != nil {
+			s.fail(sess, err.Error())
+			return
+		}
+		s.handleAdmin(sess, handle, action)
+		return
+	}
+
+	action, r, err := parseGitCommand(args)
 	if err != nil {
 		s.fail(sess, err.Error())
 		return
@@ -164,6 +185,75 @@ func (s *Server) handleSession(sess ssh.Session) {
 	_ = sess.Exit(0)
 }
 
+func (s *Server) handleAdmin(sess ssh.Session, handle string, act action) {
+	if !s.isAdmin(handle) {
+		s.fail(sess, "access denied")
+		return
+	}
+
+	dir := filepath.Join(s.repoRoot, s.configRepo)
+	if act == actionReceivePack && !repo.Exists(dir) {
+		if err := repo.CreateBare(dir); err != nil {
+			s.fail(sess, "create repository: "+err.Error())
+			return
+		}
+	}
+	if !repo.Exists(dir) {
+		s.fail(sess, "repository not found")
+		return
+	}
+
+	req := backend.Request{
+		Root:        s.repoRoot,
+		Dir:         dir,
+		Handle:      handle,
+		GitProtocol: gitProtocolEnv(sess.Environ()),
+		Admin:       true,
+		Access:      s.store,
+	}
+	var err error
+	switch act {
+	case actionUploadPack:
+		err = s.backend.UploadPack(sess.Context(), req, sess, sess, sess.Stderr())
+	case actionReceivePack:
+		err = s.backend.ReceivePack(sess.Context(), req, sess, sess, sess.Stderr())
+	}
+	if err != nil {
+		s.fail(sess, err.Error())
+		return
+	}
+	_ = sess.Exit(0)
+}
+
+func (s *Server) isAdmin(handle string) bool {
+	return s.store.Snapshot().IsAdmin(handle)
+}
+
+func parseAdminCommand(args []string, configRepo string) (action, bool, error) {
+	if len(args) != 2 {
+		return "", false, nil
+	}
+	var act action
+	switch args[0] {
+	case "git-upload-pack":
+		act = actionUploadPack
+	case "git-receive-pack":
+		act = actionReceivePack
+	default:
+		return "", false, nil
+	}
+	if !isAdminPath(args[1], configRepo) {
+		return "", false, nil
+	}
+	return act, true, nil
+}
+
+func isAdminPath(arg, configRepo string) bool {
+	raw := strings.Trim(strings.TrimSpace(arg), `"'`)
+	raw = strings.TrimPrefix(raw, "/")
+	return raw == configRepo || raw == strings.TrimSuffix(configRepo, ".git")
+}
+
 func (s *Server) listRepositories(sess ssh.Session, handle string) {
 	repos, err := repo.List(s.repoRoot)
 	if err != nil {
@@ -187,7 +277,7 @@ func (s *Server) listRepositories(sess ssh.Session, handle string) {
 }
 
 func (s *Server) fail(sess ssh.Session, msg string) {
-	_, _ = fmt.Fprintln(sess.Stderr(), "gitproxy: "+msg)
+	_, _ = fmt.Fprintln(sess.Stderr(), "githost: "+msg)
 	_ = sess.Exit(1)
 }
 

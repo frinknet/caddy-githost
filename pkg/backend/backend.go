@@ -4,8 +4,8 @@ import (
 	"context"
 	"io"
 
-	"github.com/frinknet/caddy-gitproxy/pkg/access"
-	"github.com/frinknet/caddy-gitproxy/pkg/repo"
+	"github.com/frinknet/caddy-githost/pkg/access"
+	"github.com/frinknet/caddy-githost/pkg/repo"
 )
 
 type Request struct {
@@ -15,6 +15,8 @@ type Request struct {
 	Handle      string
 	Role        access.Role
 	GitProtocol string
+	Admin       bool
+	Access      *access.Store
 }
 
 type Backend interface {

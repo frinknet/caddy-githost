@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/frinknet/caddy-gitproxy/pkg/access"
-	"github.com/frinknet/caddy-gitproxy/pkg/backend"
-	"github.com/frinknet/caddy-gitproxy/pkg/repo"
+	"github.com/frinknet/caddy-githost/pkg/access"
+	"github.com/frinknet/caddy-githost/pkg/backend"
+	"github.com/frinknet/caddy-githost/pkg/repo"
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -293,7 +293,7 @@ func TestSSHListRepositories(t *testing.T) {
 	client := dial(t, srv, clientSigner)
 
 	want := "acme/app.git  owner\nacme/tools.git  owner\n"
-	for _, command := range []string{"gitproxy-list", ""} {
+	for _, command := range []string{"githost-list", ""} {
 		code, stdout, stderr := runCommand(t, client, command)
 		if code != 0 {
 			t.Fatalf("%q: exit %d, stderr %q", command, code, stderr)

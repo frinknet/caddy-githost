@@ -1,424 +1,311 @@
-Fair point—defaulting `listen_addr` to **`:22`** matches real SSH (`git@host:repo.git` without custom port flags) while treating elevated port privileges as expected in a Docker environment.
+# caddy-githost design
 
-Here is the updated **spec**, **Caddyfile**, **minimal Go implementation**, and **antipatterns** with `:22` as the default port and Docker privilege handling built in.
+This is the target design for an SSH Git server packaged as a Caddy v2 app. It
+describes the implemented design and the remaining aspirational pieces. The
+current status lives in `README.md`; known gaps live in `BACKLOG.md`.
 
----
+## Status
 
-## 1. Updated Specification
+Implemented:
 
-### Goals & Reuse Boundaries
+- One Caddy app module, `githost`, configured by a global Caddyfile option.
+- SSH listener with public-key authentication against a users file.
+- Per-org ACLs and role policy: owner, coder, guest, block.
+- Clone, fetch, push, repository creation on owner push, and confirmed
+  repository deletion.
+- Repository listing over SSH with `githost-list`.
+- A config repository, `server-access.git` by default, whose default branch is
+  materialized into `config_dir` and reloaded in process.
 
-* **Reuse from Go & Caddy:**
-* `crypto/ed25519` & `crypto/rand` to generate the SSH host key.
-* `ctx.Storage()` (`certmagic.Storage`) to persist and reload the host key across container restarts and Caddy reloads.
-* Existing in-process `Backend` shared with the HTTP Git handler (no loopback HTTP calls, no OS user accounts).
+Not implemented:
 
+- An HTTP Git endpoint. The backend is shared by design so an HTTP handler can
+  be added without loopback calls or OS accounts.
+- A repository hint for `git ls-remote`. See `BACKLOG.md`.
 
-* **Use from SSH packages (`golang.org/x/crypto/ssh` + `gliderlabs/ssh`):**
-* OpenSSH key parsing/matching (`ParseAuthorizedKey`, `KeysEqual`, `MarshalPrivateKey`, `ParsePrivateKey`).
-* SSH transport and session handling for `exec` channels.
+## Goals and boundaries
 
+Reuse:
 
-* **Out of scope:** Interactive shells, PTYs, port forwarding, agent forwarding, SFTP, `/etc/ssh`, and host `sshd`.
+- `crypto/ed25519` and `crypto/rand` for the SSH host key.
+- Caddy `ctx.Storage()` (`certmagic.Storage`) for the fallback host key.
+- A single in-process `Backend` that any future HTTP handler can share.
+- `golang.org/x/crypto/ssh` for key parsing, signatures, and transport types.
+- `github.com/gliderlabs/ssh` for the TCP server and session handling.
+- `github.com/go-git/go-git/v6` for the Git wire protocol, so the image needs
+  no external `git` binary.
 
-### Module, Port & Docker Lifecycle Contract
+Out of scope:
 
-* **Module ID:** `gitproxy` (`caddy.Module`, `caddy.App`, `caddy.Provisioner`, `caddyfile.Unmarshaler`).
-* **Default port:** `listen_addr` defaults to **`:22`** (or whatever port is configured, e.g. `:2222`). Binding `:22` inside Docker assumes elevated privileges (running as root or with `CAP_NET_BIND_SERVICE` / `cap_add: [NET_BIND_SERVICE]`) and publishing port `22` (`-p 22:22` or custom host port `-p 2222:22`).
-* **Config fields:**
-* `listen_addr` (string, default `:22`): TCP listen address.
-* `repo_root` (string, default `/var/lib/gitproxy/repos`): Bare repository root shared with HTTP.
-* `host_key_path` (string, default `gitproxy/ssh_host_ed25519`): Path inside Caddy `Storage`.
-* `users` (`[]UserRule`): Logical users, authorized keys, allowed repo patterns, and `read_only` flag.
+- Interactive shells, PTYs, port forwarding, agent forwarding, SFTP.
+- `/etc/ssh`, an OS `sshd`, or per-user OS accounts.
+- Fake refs as a repository listing.
 
+## Module and configuration
 
-* **Lifecycle:**
-1. `Provision(ctx)`: Applies defaults (`:22`, `/var/lib/gitproxy/repos`), builds `Backend`, loads/creates the host signer via `ctx.Storage()`, and configures `ssh.Server`.
-2. `Start()`: Binds `net.Listen("tcp", a.ListenAddr)` synchronously (surfacing permission or bind errors immediately) and serves in a tracked goroutine.
-3. `Stop()`: Closes `ssh.Server` and `net.Listener`, then waits for active session goroutines.
+Module ID: `githost` (`caddy.Module`, `caddy.App`, `caddy.Provisioner`).
 
-
-
-### Session & Command Contract
-
-* **Auth (`PublicKeyHandler`):** Match presented public key against `users` via `gossh.KeysEqual`; store matched user in session context.
-* **Allowlist:** Accept only `git-upload-pack '<repo>'` and `git-receive-pack '<repo>'` (two tokens, unquoted non-empty repo). Reject shells, port forwards, SFTP, and other commands with an error on `s.Stderr()` and exit `1`.
-* **Path safety:** Clean path, strip leading slashes, normalize `.git` suffix consistently with HTTP, and reject `..` segments or paths escaping `repo_root`.
-* **Execution:** Enforce read/write and repo rules; pass `s` (stdin/stdout) and `s.Stderr()` straight to `backend.UploadPack` or `backend.ReceivePack`; write errors to `s.Stderr()` and exit `1` on error or `0` on success.
-
----
-
-## 2. Caddyfile Example
+Caddyfile global option:
 
 ```caddyfile
 {
-	gitproxy {
-		# Defaults to :22; explicit here for clarity in Docker
+	githost {
 		listen_addr :22
-		repo_root /var/lib/gitproxy/repos
-
-		user alice {
-			key ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyAlice1111111111111111 alice@workstation
-			repos app/* docs/handbook.git
-		}
-
-		user bob {
-			key ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyBob22222222222222222 bob@laptop
-			repos app/web.git
-			read_only true
-		}
+		repo_root /var/lib/githost/repos
+		config_dir /var/caddy/config
+		config_repo server-access.git
+		secret "correct horse battery staple"
 	}
 }
-
-git.example.com {
-	route /repos/* {
-		respond "HTTP git endpoint for {path}" 200
-	}
-}
-
 ```
 
----
+Fields:
 
-## 3. Minimal Go Implementation
+| Field | JSON key | Default | Rules |
+| --- | --- | --- | --- |
+| Listen address | `listen_addr` | `:22` | `host:port`; binds the given interface, not only wildcard |
+| Repository root | `repo_root` | `/var/lib/githost/repos` | absolute path, created on provision |
+| Config directory | `config_dir` | `/var/caddy/config` | absolute path, created on provision |
+| Config repository | `config_repo` | `server-access.git` | one path component ending in `.git`, under `repo_root` |
+| Host key secret | `secret` | empty | optional; derives the host key instead of storing it |
+
+Unknown subdirectives and extra arguments are rejected. There is no user list
+in Caddy config; identity and authorization live in files.
+
+Defaults are applied before validation. `Provision` creates `repo_root` and
+`config_dir`, opens the access store, resolves the host key, and builds the
+transport and backend.
+
+## Access model
+
+### Users
+
+`<config_dir>/users`, one line per user:
+
+```text
+<key-type> <base64-key> @<handle> <email>
+```
+
+Blank lines and `#` comments are ignored. Handles match
+`[A-Za-z0-9][A-Za-z0-9._-]*` and carry a leading `@`. Duplicate handles and
+duplicate keys are load errors. A presented key authenticates as its handle. A
+missing users file authenticates nobody.
+
+### Admins
+
+`<config_dir>/admins`, one `@handle` per line, comments allowed:
+
+```text
+@alice  # primary admin
+```
+
+Every listed handle must exist in `users`; unknown handles and duplicates are
+load errors. A missing or empty file means nobody may push or clone the config
+repository. The pushing handle must remain in the pushed `admins` file, so an
+admin cannot lock itself out.
+
+### Org ACLs
+
+`<config_dir>/<org>.access`, one line per handle:
+
+```text
+@<handle> <role> [# comment]
+```
+
+| Role | Read | Push | Notes |
+| --- | --- | --- | --- |
+| `owner` | yes | any ref | may create missing repos in the org |
+| `coder` | yes | `refs/heads/<handle>-*` only | checked before ref updates |
+| `guest` | yes | no | |
+| `block` | no | no | explicit denial |
+
+Unknown handles, unknown roles, and duplicate entries are load errors. A
+missing or empty ACL file denies every repository in its org.
+
+### Loading
+
+The access store reads `users`, `admins`, and `*.access` from `config_dir`,
+parses them into an immutable snapshot, and swaps the snapshot atomically.
+Loading fails closed. Snapshots are refreshed on `caddy reload` and after a
+successful push to the config repository.
+
+## Repositories
+
+A repository path is exactly `<org>/<name>.git`. A missing `.git` suffix is
+added; quotes and a leading slash are stripped. Reject deeper nesting, `..`,
+invalid characters, reserved names (`users`, `server-access`, `*.access`), and
+paths escaping `repo_root`.
+
+Repositories are bare directories under `repo_root`. An `owner` pushing to a
+missing repository creates it with `HEAD` at `refs/heads/main`. Other roles
+cannot create repositories.
+
+### Listing
+
+`githost-list`, or a session that requests no command and no PTY, prints one
+line per repository the handle may read:
+
+```text
+acme/app.git  owner
+acme/tools.git  guest
+```
+
+The second column is the role in that org. Repos are sorted by path. Orgs the
+handle cannot read, including `block`, contribute nothing. The command exits
+`0` even when the listing is empty.
+
+### Deletion
+
+An owner deletes a repository by deleting its default branch, resolved from
+`HEAD`:
+
+```sh
+git push origin :refs/heads/main
+```
+
+The first push is refused and names the retry, because the deletion would
+destroy every other ref with it. Confirm with the `confirm-delete` push option:
+
+```sh
+git push -o confirm-delete origin :refs/heads/main
+```
+
+Only an owner may delete. Deletion is refused for reserved names and paths that
+are not bare repositories. After the ref update, the directory moves into
+`<repo_root>/.trash/` and is removed, so a push either leaves the repository
+untouched or removes it completely. A later owner push recreates it empty.
+
+## Config repository
+
+`<repo_root>/<config_repo>` is a top-level bare repository with a special
+session route. Only handles listed in the current `admins` snapshot may read or
+push it. A missing repository is created on the first admin push.
+
+The default branch is the config tree. Every root entry must be `users`,
+`admins`, or `<org>.access`; nested paths, non-regular files, unknown names,
+and deletion of the default branch are rejected. The push must update the
+default branch. The tree is parsed and validated before any ref moves.
+
+Validation rejects a tree whose ACL references an unknown handle, whose
+`admins` names an unknown handle, or whose `admins` no longer contains the
+pushing handle. A rejected push leaves the installed files and the live
+snapshot unchanged.
+
+On success, `users`, `admins`, and `*.access` are written to `config_dir` with
+temporary files and renames, any stale access file is removed, and the store
+swaps in the new snapshot. No `caddy reload` is needed. The config repository
+is not an org repository and never appears in listings.
+
+## SSH transport
+
+Authentication:
+
+- Match the presented public key against the users snapshot. `KeysEqual` is
+  the comparison; the SSH username is not identity.
+- Store the authenticated handle in the session context.
+- Deny sessions with no authenticated handle.
+
+Allowed commands:
+
+- `git-upload-pack '<repo>'`
+- `git-receive-pack '<repo>'`
+- `githost-list`
+- no command and no PTY (same listing)
+
+Everything else, including shells, `git-upload-archive`, extra arguments,
+PTYs, and forwarding, is rejected with a message on stderr and exit `1`.
+Errors are written to stderr before exiting `1`; success exits `0`.
+
+Path safety rejects empty paths, traversal segments, backslashes, deeper
+nesting, and paths escaping `repo_root`.
+
+## Host key
+
+The server presents one Ed25519 host key.
+
+- With `secret`, the key is derived with scrypt (fixed salt
+  `caddy-githost/ssh-host-key/v1`, `N=32768`, `r=8`, `p=1`) and
+  `ed25519.NewKeyFromSeed`. Nothing is written to storage, and the same secret
+  yields the same key across restarts.
+- Without `secret`, the key is loaded from or generated into Caddy storage at
+  `githost/ssh_host_ed25519` and reused across restarts and reloads.
+
+The secret is as sensitive as a private key. It must not be blank when set.
+
+## Lifecycle
+
+1. `Provision`: apply defaults, validate, create `repo_root` and `config_dir`,
+   open the access store, resolve the host key, construct the backend and
+   server.
+2. `Start`: bind `net.Listen("tcp", listen_addr)` synchronously so bind and
+   permission errors surface immediately, then serve in a tracked goroutine.
+3. `Stop`: close the SSH server and listener, then wait for session goroutines.
+
+Reloading Caddy provisions a new instance and stops the old one; the host key
+persists through storage or the configured secret.
+
+## Backend
+
+`Backend` is an in-process interface:
 
 ```go
-package gitproxy
-
-import (
-	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"errors"
-	"fmt"
-	"io"
-	"io/fs"
-	"net"
-	"path"
-	"strings"
-	"sync"
-
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
-	"github.com/caddyserver/certmagic"
-	"github.com/gliderlabs/ssh"
-	gossh "golang.org/x/crypto/ssh"
-)
-
-func init() {
-	caddy.RegisterModule(GitProxyApp{})
-}
-
 type Backend interface {
-	UploadPack(ctx context.Context, repo string, stdin io.Reader, stdout, stderr io.Writer) error
-	ReceivePack(ctx context.Context, repo string, stdin io.Reader, stdout, stderr io.Writer) error
+	UploadPack(ctx context.Context, req Request, stdin io.Reader, stdout, stderr io.Writer) error
+	ReceivePack(ctx context.Context, req Request, stdin io.Reader, stdout, stderr io.Writer) error
 }
-
-type UserRule struct {
-	Name     string
-	Keys     []gossh.PublicKey
-	Repos    []string
-	ReadOnly bool
-}
-
-type GitProxyApp struct {
-	ListenAddr   string     `json:"listen_addr,omitempty"`
-	RepoRoot     string     `json:"repo_root,omitempty"`
-	HostKeyPath  string     `json:"host_key_path,omitempty"`
-	Users        []UserRule `json:"users,omitempty"`
-
-	storage certmagic.Storage
-	backend Backend
-	server  *ssh.Server
-	ln      net.Listener
-	wg      sync.WaitGroup
-}
-
-func (GitProxyApp) CaddyModule() caddy.ModuleInfo {
-	return caddy.ModuleInfo{
-		ID:  "gitproxy",
-		New: func() caddy.Module { return new(GitProxyApp) },
-	}
-}
-
-func (a *GitProxyApp) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if d.NextArg() {
-			return d.ArgErr()
-		}
-		for d.NextBlock(0) {
-			switch d.Val() {
-			case "listen_addr":
-				if !d.Args(&a.ListenAddr) {
-					return d.ArgErr()
-				}
-			case "repo_root":
-				if !d.Args(&a.RepoRoot) {
-					return d.ArgErr()
-				}
-			case "host_key_path":
-				if !d.Args(&a.HostKeyPath) {
-					return d.ArgErr()
-				}
-			case "user":
-				rule, err := parseUserBlock(d)
-				if err != nil {
-					return err
-				}
-				a.Users = append(a.Users, rule)
-			default:
-				return d.Errf("unknown subdirective %q", d.Val())
-			}
-		}
-	}
-	return nil
-}
-
-func parseUserBlock(d *caddyfile.Dispenser) (UserRule, error) {
-	var rule UserRule
-	if !d.Args(&rule.Name) {
-		return rule, d.ArgErr()
-	}
-	for d.NextBlock(1) {
-		switch d.Val() {
-		case "key":
-			raw := strings.TrimSpace(strings.TrimPrefix(d.ResetToCurrentLine(), "key"))
-			pub, _, _, _, err := gossh.ParseAuthorizedKey([]byte(raw))
-			if err != nil {
-				return rule, d.Errf("invalid ssh key for user %s: %v", rule.Name, err)
-			}
-			rule.Keys = append(rule.Keys, pub)
-		case "repos":
-			rule.Repos = append(rule.Repos, d.RemainingArgs()...)
-		case "read_only":
-			if !d.Args(&rule.ReadOnly) {
-				return rule, d.ArgErr()
-			}
-		default:
-			return rule, d.Errf("unknown user option %q", d.Val())
-		}
-	}
-	return rule, nil
-}
-
-func (a *GitProxyApp) Provision(ctx caddy.Context) error {
-	if a.ListenAddr == "" {
-		a.ListenAddr = ":22"
-	}
-	if a.RepoRoot == "" {
-		a.RepoRoot = "/var/lib/gitproxy/repos"
-	}
-	if a.HostKeyPath == "" {
-		a.HostKeyPath = "gitproxy/ssh_host_ed25519"
-	}
-
-	a.storage = ctx.Storage()
-	a.backend = newLocalGitBackend(a.RepoRoot)
-
-	signer, err := loadOrCreateHostSigner(context.Background(), a.storage, a.HostKeyPath)
-	if err != nil {
-		return err
-	}
-
-	a.server = &ssh.Server{
-		Addr: a.ListenAddr,
-		PublicKeyHandler: func(sctx ssh.Context, key gossh.PublicKey) bool {
-			user, ok := a.matchKey(key)
-			if !ok {
-				return false
-			}
-			sctx.SetValue("git_user", user)
-			return true
-		},
-		Handler: a.handle,
-	}
-	a.server.AddHostKey(signer)
-	return nil
-}
-
-func (a *GitProxyApp) Start() error {
-	ln, err := net.Listen("tcp", a.ListenAddr)
-	if err != nil {
-		return fmt.Errorf("gitproxy listen %s (check privileges/port binding): %w", a.ListenAddr, err)
-	}
-	a.ln = ln
-	a.wg.Add(1)
-	go func() {
-		defer a.wg.Done()
-		if err := a.server.Serve(ln); err != nil && !errors.Is(err, net.ErrClosed) {
-			// Log via Caddy logger in production
-		}
-	}()
-	return nil
-}
-
-func (a *GitProxyApp) Stop() error {
-	if a.server != nil {
-		_ = a.server.Close()
-	}
-	if a.ln != nil {
-		_ = a.ln.Close()
-	}
-	a.wg.Wait()
-	return nil
-}
-
-func loadOrCreateHostSigner(ctx context.Context, storage certmagic.Storage, keyPath string) (gossh.Signer, error) {
-	if storage == nil {
-		return nil, errors.New("caddy storage is nil")
-	}
-	if raw, err := storage.Load(ctx, keyPath); err == nil {
-		return gossh.ParsePrivateKey(raw)
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return nil, fmt.Errorf("load ssh host key: %w", err)
-	}
-
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("generate ed25519 host key: %w", err)
-	}
-	pemBlock, err := gossh.MarshalPrivateKey(priv, "gitproxy-host-key")
-	if err != nil {
-		return nil, fmt.Errorf("marshal openssh host key: %w", err)
-	}
-	if err := storage.Store(ctx, keyPath, gossh.MarshalPrivateKeyToPEM(pemBlock)); err != nil {
-		return nil, fmt.Errorf("store ssh host key: %w", err)
-	}
-	return gossh.NewSignerFromKey(priv)
-}
-
-func (a *GitProxyApp) handle(s ssh.Session) {
-	action, rawRepo, ok := parseGitCommand(s.Command())
-	if !ok {
-		_, _ = fmt.Fprintln(s.Stderr(), "fatal: command not permitted")
-		_ = s.Exit(1)
-		return
-	}
-
-	repo, ok := normalizeRepoPath(rawRepo)
-	if !ok {
-		_, _ = fmt.Fprintln(s.Stderr(), "fatal: invalid repository path")
-		_ = s.Exit(1)
-		return
-	}
-
-	user, _ := s.Context().Value("git_user").(UserRule)
-	if !a.canAccess(user, repo, action == "receive-pack") {
-		_, _ = fmt.Fprintln(s.Stderr(), "fatal: access denied")
-		_ = s.Exit(1)
-		return
-	}
-
-	var err error
-	switch action {
-	case "upload-pack":
-		err = a.backend.UploadPack(s.Context(), repo, s, s, s.Stderr())
-	case "receive-pack":
-		err = a.backend.ReceivePack(s.Context(), repo, s, s, s.Stderr())
-	}
-	if err != nil {
-		_, _ = fmt.Fprintf(s.Stderr(), "fatal: %v\n", err)
-		_ = s.Exit(1)
-		return
-	}
-	_ = s.Exit(0)
-}
-
-func parseGitCommand(cmd []string) (action, repo string, ok bool) {
-	if len(cmd) != 2 {
-		return "", "", false
-	}
-	if cmd[0] != "git-upload-pack" && cmd[0] != "git-receive-pack" {
-		return "", "", false
-	}
-	target := strings.TrimSpace(strings.Trim(cmd[1], `"'`))
-	if target == "" {
-		return "", "", false
-	}
-	return strings.TrimPrefix(cmd[0], "git-"), target, true
-}
-
-func normalizeRepoPath(p string) (string, bool) {
-	raw := strings.Trim(strings.TrimSpace(p), `"'`)
-	if raw == "" {
-		return "", false
-	}
-	for _, seg := range strings.Split(raw, "/") {
-		if seg == ".." {
-			return "", false
-		}
-	}
-	cleaned := strings.TrimPrefix(path.Clean("/"+strings.TrimPrefix(raw, "/")), "/")
-	if cleaned == "" || cleaned == "." || strings.Contains(cleaned, "..") {
-		return "", false
-	}
-	if !strings.HasSuffix(cleaned, ".git") {
-		cleaned += ".git"
-	}
-	return cleaned, true
-}
-
-func (a *GitProxyApp) matchKey(presented gossh.PublicKey) (UserRule, bool) {
-	for _, u := range a.Users {
-		for _, k := range u.Keys {
-			if gossh.KeysEqual(presented, k) {
-				return u, true
-			}
-		}
-	}
-	return UserRule{}, false
-}
-
-func (a *GitProxyApp) canAccess(u UserRule, repo string, isWrite bool) bool {
-	if u.Name == "" || (isWrite && u.ReadOnly) {
-		return false
-	}
-	for _, pattern := range u.Repos {
-		if pattern == "*" || pattern == repo {
-			return true
-		}
-		if strings.HasSuffix(pattern, "/*") && strings.HasPrefix(repo, strings.TrimSuffix(pattern, "*")) {
-			return true
-		}
-	}
-	return false
-}
-
-type localGitBackend struct {
-	root string
-}
-
-func newLocalGitBackend(root string) *localGitBackend {
-	return &localGitBackend{root: root}
-}
-
-func (b *localGitBackend) UploadPack(_ context.Context, repo string, _ io.Reader, stdout, _ io.Writer) error {
-	_, _ = fmt.Fprintf(stdout, "upload-pack %s/%s\n", b.root, repo)
-	return nil
-}
-
-func (b *localGitBackend) ReceivePack(_ context.Context, repo string, _ io.Reader, stdout, _ io.Writer) error {
-	_, _ = fmt.Fprintf(stdout, "receive-pack %s/%s\n", b.root, repo)
-	return nil
-}
-
-var (
-	_ caddy.Module          = (*GitProxyApp)(nil)
-	_ caddy.App             = (*GitProxyApp)(nil)
-	_ caddy.Provisioner     = (*GitProxyApp)(nil)
-	_ caddyfile.Unmarshaler = (*GitProxyApp)(nil)
-)
-
 ```
 
----
+`Request` carries the parsed repository, root, directory, handle, role, Git
+protocol version, and, for the config repository, the access store and admin
+flag.
 
-## 4. Antipatterns to Avoid
+The go-git implementation:
 
-* **Allowing shell or arbitrary `exec` fallback:** Reject interactive shells (`len(cmd) == 0`) and non-git commands immediately; never shell out arbitrary strings.
-* **Trusting `s.User()` as the user identity:** Clients connect as `git@host`, so `s.User()` is `"git"`; always map verified public keys to logical users.
-* **Allowing `..` or escaped paths in repo arguments:** Reject traversal segments before joining under `repo_root`.
-* **Silent exit codes:** Always write a readable error to `s.Stderr()` before `s.Exit(1)`.
-* **Looping over HTTP (`localhost`) from SSH:** Call the shared `Backend` directly in-process.
-* **Ephemeral host keys or leaked listeners on reload:** Persist the Ed25519 host key in Caddy's `ctx.Storage()`, and close both `server` and `listener` cleanly in `Stop()`.
-* **Ignoring host port `22` conflicts in Docker:** If the Docker host already runs `sshd` on port `22`, publish `:22` from the container onto an unused host port (e.g. `-p 2222:22`) rather than colliding on the host's port `22`.
+- Opens only bare repositories that already exist.
+- Takes a per-directory read lock for upload-pack and a write lock for
+  receive-pack, so deletion and pushes do not overlap active sessions.
+- Enforces coder ref prefixes and owner-only deletion in pre-receive hooks.
+- Validates and applies config repository pushes through the same hooks.
+
+## Package layout
+
+| Package | Responsibility |
+| --- | --- |
+| root `githost.go` | package clause and blank imports of `pkg/config` and `pkg/githost` |
+| `pkg/config` | `Config`, defaults, validation, global Caddyfile option |
+| `pkg/githost` | app module, provisioning, listener lifecycle |
+| `pkg/access` | users, admins, ACL parsing, snapshots, authentication, roles |
+| `pkg/repo` | path parsing, safety checks, bare repository creation and removal, listing |
+| `pkg/backend` | `Backend` interface, go-git adapter, locking, push policy, config tree |
+| `pkg/transport` | SSH server, host key, authentication, command dispatch, listing |
+
+## Future work
+
+### HTTP Git endpoint
+
+A future HTTP handler may share the same `Backend` and access snapshot. It
+must not call back through localhost HTTP and must not use OS accounts. Git
+smart HTTP routes would enforce the same role policy and repository rules as
+SSH. Until it exists, the SSH transport is the only Git transport.
+
+### `git ls-remote` listing hint
+
+A best-effort banner may be written to the session stderr after `upload-pack`
+so git prints the readable repositories as `remote:` lines. It must never emit
+fake refs, and the e2e assertion must tolerate its absence. See
+`BACKLOG.md` for the race and ordering constraints.
+
+## Antipatterns
+
+- Trusting the SSH username or `s.User()` as identity. Map verified keys to
+  handles from the users file.
+- Rejecting only literal `..` without checking the joined path still stays
+  under `repo_root`.
+- Treating `githost-list` or a no-command session as a shell.
+- Emitting fake refs to advertise repositories.
+- Storing or logging the `secret`.
+- Writing errors only to logs. Always write a readable message to stderr
+  before an interactive failure, and exit non-zero.
+- Calling the backend over loopback HTTP from the SSH path.
+- Leaving the listener or server goroutines running on reload.
+- Publishing the container's `:22` onto a host port already used by `sshd`.

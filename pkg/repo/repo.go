@@ -119,7 +119,7 @@ func CreateBare(dir string) error {
 	if err := os.WriteFile(filepath.Join(dir, "config"), []byte(config), 0o644); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, "description"), []byte("gitproxy bare repository\n"), 0o644)
+	return os.WriteFile(filepath.Join(dir, "description"), []byte("githost bare repository\n"), 0o644)
 }
 
 func List(root string) ([]Repo, error) {

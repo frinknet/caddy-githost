@@ -1,15 +1,22 @@
 package backend
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/frinknet/caddy-gitproxy/pkg/access"
-	"github.com/frinknet/caddy-gitproxy/pkg/repo"
+	"github.com/frinknet/caddy-githost/pkg/access"
+	"github.com/frinknet/caddy-githost/pkg/repo"
 	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/filemode"
+	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage/memory"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 func command(ref string) *packp.Command {
@@ -140,5 +147,122 @@ func TestCheckDeletion(t *testing.T) {
 		Commands: mainDelete,
 	}); err != nil || remove {
 		t.Errorf("detached HEAD deletion: remove=%v err=%v", remove, err)
+	}
+}
+func adminStorage(t *testing.T, files map[string]string) (*memory.Storage, plumbing.Hash) {
+	t.Helper()
+	st := memory.NewStorage()
+	if err := st.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, plumbing.NewBranchReferenceName("main"))); err != nil {
+		t.Fatal(err)
+	}
+
+	var entries []object.TreeEntry
+	for name, content := range files {
+		obj := st.NewEncodedObject()
+		obj.SetType(plumbing.BlobObject)
+		w, err := obj.Writer()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		hash, err := st.SetEncodedObject(obj)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, object.TreeEntry{Name: name, Mode: filemode.Regular, Hash: hash})
+	}
+	sort.Sort(object.TreeEntrySorter(entries))
+
+	treeObj := st.NewEncodedObject()
+	tree := &object.Tree{Entries: entries}
+	if err := tree.Encode(treeObj); err != nil {
+		t.Fatal(err)
+	}
+	treeHash, err := st.SetEncodedObject(treeObj)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sig := object.Signature{Name: "e2e", Email: "e2e@example.com", When: time.Unix(0, 0)}
+	commit := &object.Commit{Author: sig, Committer: sig, Message: "acl", TreeHash: treeHash}
+	commitObj := st.NewEncodedObject()
+	if err := commit.Encode(commitObj); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := st.SetEncodedObject(commitObj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st, hash
+}
+
+func TestProposedAdminFiles(t *testing.T) {
+	st, hash := adminStorage(t, map[string]string{
+		"users":       "ssh-ed25519 AAAA @alice alice@example.com\n",
+		"acme.access": "@alice owner\n",
+	})
+
+	files, err := proposedAdminFiles(st, []*packp.Command{{
+		Name: plumbing.NewBranchReferenceName("main"),
+		New:  hash,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(files["users"]) != "ssh-ed25519 AAAA @alice alice@example.com\n" {
+		t.Errorf("users = %q", files["users"])
+	}
+	if string(files["acme.access"]) != "@alice owner\n" {
+		t.Errorf("acme.access = %q", files["acme.access"])
+	}
+
+	if _, err := proposedAdminFiles(st, []*packp.Command{{
+		Name: plumbing.NewBranchReferenceName("topic"),
+		New:  hash,
+	}}); err == nil {
+		t.Error("non-default branch push should be rejected")
+	}
+
+	if _, err := proposedAdminFiles(st, []*packp.Command{{
+		Name: plumbing.NewBranchReferenceName("main"),
+		New:  plumbing.ZeroHash,
+	}}); err == nil {
+		t.Error("default branch deletion should be rejected")
+	}
+}
+
+func TestValidateAdminPush(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := gossh.NewPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := strings.TrimSpace(string(gossh.MarshalAuthorizedKey(key))) + " @alice alice@example.com\n"
+	req := Request{Handle: "@alice"}
+
+	files := map[string][]byte{
+		"users":  []byte(line),
+		"admins": []byte("@alice\n"),
+	}
+	if err := validateAdminPush(req, files); err != nil {
+		t.Fatalf("admin retained: %v", err)
+	}
+
+	delete(files, "admins")
+	if err := validateAdminPush(req, files); err == nil {
+		t.Error("push dropping the admins file should be rejected")
+	}
+
+	files["admins"] = []byte("@bob\n")
+	if err := validateAdminPush(req, files); err == nil {
+		t.Error("push removing the pushing admin should be rejected")
 	}
 }

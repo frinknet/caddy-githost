@@ -36,8 +36,8 @@ RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
     --mount=type=cache,id=gobuild,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux \
     xcaddy build \
-    --with github.com/frinknet/caddy-gitproxy \
-    --replace github.com/frinknet/caddy-gitproxy=/src \
+    --with github.com/frinknet/caddy-githost \
+    --replace github.com/frinknet/caddy-githost=/src \
     --output /out/caddy
 
 # collect the licenses of caddy and every plugin linked into the binary

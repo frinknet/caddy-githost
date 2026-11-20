@@ -1,10 +1,10 @@
 #!/bin/sh
-# e2e test runner: starts caddy-gitproxy:test with the fixture Caddyfile,
+# e2e test runner: starts caddy-githost:test with the fixture Caddyfile,
 # publishes the SSH port, and exercises clone, fetch, and push over SSH.
 
 set -eu
 
-IMAGE=caddy-gitproxy:test
+IMAGE=caddy-githost:test
 PORT=${E2E_SSH_PORT:-2222}
 FIXTURES=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/e2e/fixtures
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -47,14 +47,14 @@ for broken in "$FIXTURES"/broken/*.Caddyfile; do
 	fi
 done
 
-mkdir -p "$WORK/acme" "$WORK/other" "$WORK/data" "$WORK/cache" "$WORK/seed"
+mkdir -p "$WORK/acme" "$WORK/other" "$WORK/config" "$WORK/data" "$WORK/cache" "$WORK/seed"
 
 git init -q --bare "$WORK/acme/app.git"
 git -C "$WORK/acme/app.git" symbolic-ref HEAD refs/heads/main
 git init -q --bare "$WORK/acme/tools.git"
 git init -q --bare "$WORK/other/secret.git"
 git -C "$WORK/seed" init -q
-printf 'hello gitproxy\n' >"$WORK/seed/README"
+printf 'hello githost\n' >"$WORK/seed/README"
 git -C "$WORK/seed" add README
 git -C "$WORK/seed" -c user.name=e2e -c user.email=e2e@example.com commit -qm init
 git -C "$WORK/seed" push -q "$WORK/acme/app.git" HEAD:refs/heads/main
@@ -76,14 +76,16 @@ user_line() {
 	user_line "$WORK/id_bob" @bob
 	user_line "$WORK/id_carol" @carol
 	user_line "$WORK/id_mallory" @mallory
-} >"$WORK/users"
-printf '@alice owner\n@bob guest\n@carol coder\n@mallory block\n' >"$WORK/acme.access"
+} >"$WORK/config/users"
+printf '@alice owner\n@bob guest\n@carol coder\n@mallory block\n' >"$WORK/config/acme.access"
+printf '@alice\n' >"$WORK/config/admins"
 
 CID=$(timeout 60s docker run -d \
 	-u "$(id -u):$(id -g)" \
 	-p "127.0.0.1:$PORT:2222" \
 	-v "$FIXTURES/Caddyfile:/etc/caddy/Caddyfile:ro" \
 	-v "$WORK:/srv/git" \
+	-v "$WORK/config:/srv/config" \
 	-v "$WORK/data:/var/lib/caddy" \
 	-v "$WORK/cache:/var/cache/caddy" \
 	"$IMAGE" run --config /etc/caddy/Caddyfile --adapter caddyfile)
@@ -118,8 +120,11 @@ if ! wait_for_ssh; then
 	fail "SSH endpoint did not become ready; see diagnostics above"
 fi
 
+[ -z "$(find "$WORK/data" -name ssh_host_ed25519 -print -quit 2>/dev/null)" ] ||
+	fail "host key was stored despite secret"
+
 GIT_SSH_COMMAND="$(ssh_for "$WORK/id_alice")" timeout 60s git clone -q "$URL" "$WORK/clone"
-[ "$(cat "$WORK/clone/README")" = "hello gitproxy" ] || fail "clone content mismatch"
+[ "$(cat "$WORK/clone/README")" = "hello githost" ] || fail "clone content mismatch"
 
 printf 'push from owner\n' >>"$WORK/clone/README"
 git -C "$WORK/clone" add README
@@ -160,10 +165,10 @@ ssh_exec() {
 owner_listing=$(printf 'acme/app.git  owner\nacme/tools.git  owner')
 guest_listing=$(printf 'acme/app.git  guest\nacme/tools.git  guest')
 coder_listing=$(printf 'acme/app.git  coder\nacme/tools.git  coder')
-[ "$(ssh_exec alice gitproxy-list)" = "$owner_listing" ] || fail "owner listing mismatch"
-[ "$(ssh_exec bob gitproxy-list)" = "$guest_listing" ] || fail "guest listing mismatch"
-[ "$(ssh_exec carol gitproxy-list)" = "$coder_listing" ] || fail "coder listing mismatch"
-[ -z "$(ssh_exec mallory gitproxy-list)" ] || fail "blocked handle saw a repository listing"
+[ "$(ssh_exec alice githost-list)" = "$owner_listing" ] || fail "owner listing mismatch"
+[ "$(ssh_exec bob githost-list)" = "$guest_listing" ] || fail "guest listing mismatch"
+[ "$(ssh_exec carol githost-list)" = "$coder_listing" ] || fail "coder listing mismatch"
+[ -z "$(ssh_exec mallory githost-list)" ] || fail "blocked handle saw a repository listing"
 [ "$(ssh_exec alice '')" = "$owner_listing" ] || fail "no-command listing mismatch"
 
 if command -v ssh >/dev/null 2>&1; then
@@ -174,6 +179,57 @@ if command -v ssh >/dev/null 2>&1; then
 		fail "shell command was accepted"
 	fi
 fi
+
+ADMIN_URL="ssh://git@127.0.0.1:$PORT/githost-config.git"
+mkdir "$WORK/admin"
+git -C "$WORK/admin" init -q
+cp "$WORK/config/users" "$WORK/config/admins" "$WORK/config/acme.access" "$WORK/admin/"
+git -C "$WORK/admin" add users admins acme.access
+git -C "$WORK/admin" -c user.name=e2e -c user.email=e2e@example.com commit -qm acl
+
+if GIT_SSH_COMMAND="$(ssh_for "$WORK/id_bob")" timeout 60s \
+	git -C "$WORK/admin" push -q "$ADMIN_URL" HEAD:refs/heads/main 2>/dev/null; then
+	fail "non-admin pushed server-access.git"
+fi
+
+GIT_SSH_COMMAND="$(ssh_for "$WORK/id_alice")" timeout 60s \
+	git -C "$WORK/admin" push -q "$ADMIN_URL" HEAD:refs/heads/main
+[ -d "$WORK/githost-config.git" ] || fail "config_repo path was not created"
+
+printf '@alice owner\n@bob owner\n@carol coder\n@mallory block\n' >"$WORK/admin/acme.access"
+printf '@alice\n@bob\n' >"$WORK/admin/admins"
+git -C "$WORK/admin" add acme.access admins
+git -C "$WORK/admin" -c user.name=e2e -c user.email=e2e@example.com commit -qm promote-bob
+GIT_SSH_COMMAND="$(ssh_for "$WORK/id_alice")" timeout 60s \
+	git -C "$WORK/admin" push -q "$ADMIN_URL" HEAD:refs/heads/main
+
+GIT_SSH_COMMAND="$(ssh_for "$WORK/id_bob")" timeout 60s \
+	git -C "$WORK/bob-clone" push -q origin HEAD:refs/heads/main ||
+	fail "ACL push did not take effect"
+
+GIT_SSH_COMMAND="$(ssh_for "$WORK/id_bob")" timeout 30s \
+	git ls-remote "$ADMIN_URL" >/dev/null ||
+	fail "admins file in the repo did not grant admin access"
+
+printf '@nobody owner\n' >"$WORK/admin/acme.access"
+git -C "$WORK/admin" add acme.access
+git -C "$WORK/admin" -c user.name=e2e -c user.email=e2e@example.com commit -qm malformed
+if GIT_SSH_COMMAND="$(ssh_for "$WORK/id_alice")" timeout 60s \
+	git -C "$WORK/admin" push -q "$ADMIN_URL" HEAD:refs/heads/main 2>/dev/null; then
+	fail "malformed ACL push was accepted"
+fi
+grep -q '@nobody' "$WORK/config/acme.access" && fail "malformed ACL was installed"
+[ "$(ssh_exec bob githost-list)" = "$owner_listing" ] || fail "malformed ACL push changed access"
+
+printf '@alice owner\n@bob owner\n@carol coder\n@mallory block\n' >"$WORK/admin/acme.access"
+printf '@bob\n' >"$WORK/admin/admins"
+git -C "$WORK/admin" add acme.access admins
+git -C "$WORK/admin" -c user.name=e2e -c user.email=e2e@example.com commit -qm lockout
+if GIT_SSH_COMMAND="$(ssh_for "$WORK/id_alice")" timeout 60s \
+	git -C "$WORK/admin" push -q "$ADMIN_URL" HEAD:refs/heads/main 2>/dev/null; then
+	fail "push removing the pushing admin was accepted"
+fi
+grep -q '@alice' "$WORK/config/admins" || fail "admin lockout was installed"
 
 if GIT_SSH_COMMAND="$(ssh_for "$WORK/id_alice")" timeout 60s \
 	git -C "$WORK/clone" push -q origin :refs/heads/main 2>"$WORK/delete.out"; then
