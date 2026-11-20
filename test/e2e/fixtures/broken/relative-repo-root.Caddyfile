@@ -1,0 +1,9 @@
+{
+	gitproxy {
+		repo_root relative/repos
+	}
+}
+
+:8080 {
+	respond "broken" 200
+}

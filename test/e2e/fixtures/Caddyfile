@@ -1,0 +1,13 @@
+{
+	gitproxy {
+		listen_addr :2222
+		repo_root /srv/git
+		host_key_path gitproxy/ssh_host_ed25519
+	}
+
+	admin 127.0.0.1:2019
+}
+
+:8080 {
+	respond "gitproxy e2e" 200
+}

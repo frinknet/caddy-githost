@@ -1,0 +1,9 @@
+{
+	gitproxy {
+		unknown_option true
+	}
+}
+
+:8080 {
+	respond "broken" 200
+}

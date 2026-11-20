@@ -1,0 +1,11 @@
+{
+	gitproxy {
+		listen_addr :22
+		repo_root /var/lib/gitproxy/repos
+	}
+}
+
+:80 {
+	root * /srv/www
+	file_server
+}
