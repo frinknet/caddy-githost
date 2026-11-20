@@ -51,6 +51,7 @@ mkdir -p "$WORK/acme" "$WORK/other" "$WORK/data" "$WORK/cache" "$WORK/seed"
 
 git init -q --bare "$WORK/acme/app.git"
 git -C "$WORK/acme/app.git" symbolic-ref HEAD refs/heads/main
+git init -q --bare "$WORK/acme/tools.git"
 git init -q --bare "$WORK/other/secret.git"
 git -C "$WORK/seed" init -q
 printf 'hello gitproxy\n' >"$WORK/seed/README"
@@ -151,6 +152,19 @@ fi
 if GIT_SSH_COMMAND="$(ssh_for "$WORK/id_alice")" timeout 30s git ls-remote "ssh://git@127.0.0.1:$PORT/other/secret.git" >/dev/null 2>&1; then
 	fail "repository without an org ACL was readable"
 fi
+
+ssh_exec() {
+	timeout 30s ssh -T -i "$WORK/id_$1" $SSH_OPTS -p "$PORT" git@127.0.0.1 "$2" </dev/null
+}
+
+owner_listing=$(printf 'acme/app.git  owner\nacme/tools.git  owner')
+guest_listing=$(printf 'acme/app.git  guest\nacme/tools.git  guest')
+coder_listing=$(printf 'acme/app.git  coder\nacme/tools.git  coder')
+[ "$(ssh_exec alice gitproxy-list)" = "$owner_listing" ] || fail "owner listing mismatch"
+[ "$(ssh_exec bob gitproxy-list)" = "$guest_listing" ] || fail "guest listing mismatch"
+[ "$(ssh_exec carol gitproxy-list)" = "$coder_listing" ] || fail "coder listing mismatch"
+[ -z "$(ssh_exec mallory gitproxy-list)" ] || fail "blocked handle saw a repository listing"
+[ "$(ssh_exec alice '')" = "$owner_listing" ] || fail "no-command listing mismatch"
 
 if command -v ssh >/dev/null 2>&1; then
 	if timeout 30s ssh -i "$WORK/id_alice" $SSH_OPTS -p "$PORT" git@127.0.0.1 "git-upload-pack '../acme/app.git'" >/dev/null 2>&1; then

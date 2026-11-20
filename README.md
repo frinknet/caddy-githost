@@ -13,17 +13,18 @@ under `repo_root`.
 - Module ID: `gitproxy` (a Caddy app, not an HTTP handler).
 - Caddyfile global option: `gitproxy { ... }` with `listen_addr`, `repo_root`,
   and `host_key_path`. Unknown subdirectives and extra arguments are rejected.
-- Only `git-upload-pack '<org>/<name>.git'` and
-  `git-receive-pack '<org>/<name>.git'` are accepted. Shells, PTYs, port
-  forwarding, agent forwarding, and SFTP are denied.
+- `git-upload-pack '<org>/<name>.git'`, `git-receive-pack '<org>/<name>.git'`,
+  and `gitproxy-list` are accepted; a session with no command (and no PTY)
+  prints the same listing. Shells, PTYs, port forwarding, agent forwarding,
+  and SFTP are denied.
 - Host key: one Ed25519 key persisted in Caddy storage, generated on first
   use and reused across restarts and reloads.
 - Git backend: `github.com/go-git/go-git/v6` (`v6.0.0-beta.1`), so the image
   needs no external `git` binary.
 - `sh test/unit.sh` and `./test/e2e.sh` pass.
 
-Not implemented yet: repo listing, `server-access.git`, and an HTTP Git
-endpoint. See `BACKLOG.md` (local, git-ignored).
+Not implemented yet: `server-access.git` and an HTTP Git endpoint. See
+`BACKLOG.md` (local, git-ignored).
 
 ## Configuration
 
@@ -96,6 +97,21 @@ escaping `repo_root` are rejected.
 An `owner` pushing to a missing repo creates a bare repo with `HEAD` pointing
 at `refs/heads/main`. Other roles cannot create repos.
 
+### Listing repositories
+
+`ssh git@host gitproxy-list`, or an SSH session that requests no command and
+no PTY, prints one line per repository the authenticated handle can read:
+
+```text
+acme/app.git  owner
+acme/tools.git  owner
+```
+
+The first column is the repo path and the second its role in that org. Repos
+are sorted by path. An org whose ACL gives the handle no read role, including
+`block`, contributes nothing, and the command still exits `0`. There is no Git
+protocol for listing repositories, so `git ls-remote` cannot advertise them.
+
 ### Deleting a repository
 
 An `owner` deletes a repository by pushing a deletion of its default branch,
@@ -147,7 +163,7 @@ org is denied.
 | `pkg/access/` | Users file parsing, org ACL parsing, immutable access snapshots, key authentication, role resolution. |
 | `pkg/repo/` | Repo path parsing and safety checks, bare repo creation, repo listing over the filesystem. |
 | `pkg/backend/` | `Backend` interface, go-git server adapter, per-repo locking, push policy. |
-| `pkg/transport/` | SSH server, host key persistence, public-key auth, command allowlist, session dispatch. |
+| `pkg/transport/` | SSH server, host key persistence, public-key auth, command allowlist, session dispatch, repository listing. |
 | `www/Caddyfile` | Shipped Caddyfile, copied to `/srv/www` in the image. Serves `/srv/www` on `:80` and starts `gitproxy` on `:22`. |
 | `test/unit.sh` | Canonical unit layer: one bounded builder container running `gofmt -l . && go vet ./... && go test -timeout=120s ./...`. |
 | `test/e2e.sh` | Canonical e2e layer: starts `caddy-gitproxy:test`, seeds a bare repo and access files, then runs clone, push, and denial checks over SSH. |
@@ -192,6 +208,8 @@ root, and Caddy data/cache directories, then asserts:
   fails;
 - a blocked handle cannot read;
 - a repo in an org without an ACL is unreadable;
+- `gitproxy-list`, and a session with no command, print exactly the readable
+  repos with each role's label, and nothing for a blocked handle;
 - traversal paths and shell commands are rejected;
 - deleting the default branch without `-o confirm-delete` is refused with the
   retry command in the error, leaves the repo and branch intact, and the

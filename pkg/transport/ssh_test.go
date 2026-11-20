@@ -94,6 +94,12 @@ func startTestServer(t *testing.T, role string, withRepo bool) (*Server, *access
 		}
 	}
 
+	srv, store, fake := startServerAt(t, root)
+	return srv, store, fake, clientSigner
+}
+
+func startServerAt(t *testing.T, root string) (*Server, *access.Store, *fakeBackend) {
+	t.Helper()
 	store, err := access.Open(root)
 	if err != nil {
 		t.Fatal(err)
@@ -111,7 +117,7 @@ func startTestServer(t *testing.T, role string, withRepo bool) (*Server, *access
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = srv.Stop() })
-	return srv, store, fake, clientSigner
+	return srv, store, fake
 }
 
 func dial(t *testing.T, srv *Server, signer gossh.Signer) *gossh.Client {
@@ -248,5 +254,55 @@ func TestSSHRejectsUnknownKey(t *testing.T) {
 	if client, err := gossh.Dial("tcp", srv.Addr(), cfg); err == nil {
 		_ = client.Close()
 		t.Fatal("unauthenticated client connected")
+	}
+}
+
+func TestSSHListRepositories(t *testing.T) {
+	root := t.TempDir()
+
+	clientSigner, clientAuthorized := newSigner(t)
+	fields := strings.Fields(strings.TrimSpace(string(clientAuthorized)))
+	users := fmt.Sprintf("%s %s @alice alice@example.com\n", fields[0], fields[1])
+	if err := os.WriteFile(filepath.Join(root, "users"), []byte(users), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "acme.access"), []byte("@alice owner\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "other.access"), []byte("@alice block\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	repos := []repo.Repo{
+		{Org: "acme", Name: "tools"},
+		{Org: "acme", Name: "app"},
+		{Org: "other", Name: "secret"},
+		{Org: "zeta", Name: "orphan"},
+	}
+	for _, r := range repos {
+		dir, err := r.Dir(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.CreateBare(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	srv, _, fake := startServerAt(t, root)
+	client := dial(t, srv, clientSigner)
+
+	want := "acme/app.git  owner\nacme/tools.git  owner\n"
+	for _, command := range []string{"gitproxy-list", ""} {
+		code, stdout, stderr := runCommand(t, client, command)
+		if code != 0 {
+			t.Fatalf("%q: exit %d, stderr %q", command, code, stderr)
+		}
+		if stdout != want {
+			t.Errorf("%q: stdout = %q, want %q", command, stdout, want)
+		}
+	}
+	if calls, _ := fake.snapshot(); calls != 0 {
+		t.Errorf("backend called %d times", calls)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 
@@ -108,6 +109,11 @@ func (s *Server) handleSession(sess ssh.Session) {
 		return
 	}
 
+	if args := sess.Command(); len(args) == 0 || (len(args) == 1 && args[0] == "gitproxy-list") {
+		s.listRepositories(sess, handle)
+		return
+	}
+
 	action, r, err := parseGitCommand(sess.Command())
 	if err != nil {
 		s.fail(sess, err.Error())
@@ -154,6 +160,28 @@ func (s *Server) handleSession(sess ssh.Session) {
 	if err != nil {
 		s.fail(sess, err.Error())
 		return
+	}
+	_ = sess.Exit(0)
+}
+
+func (s *Server) listRepositories(sess ssh.Session, handle string) {
+	repos, err := repo.List(s.repoRoot)
+	if err != nil {
+		s.fail(sess, "list repositories: "+err.Error())
+		return
+	}
+	sort.Slice(repos, func(i, j int) bool { return repos[i].String() < repos[j].String() })
+
+	snapshot := s.store.Snapshot()
+	for _, r := range repos {
+		role := snapshot.Role(r.Org, handle)
+		if !role.CanRead() {
+			continue
+		}
+		if _, err := fmt.Fprintf(sess, "%s  %s\n", r, role); err != nil {
+			s.fail(sess, "list repositories: "+err.Error())
+			return
+		}
 	}
 	_ = sess.Exit(0)
 }
