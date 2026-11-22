@@ -15,13 +15,11 @@ Implemented:
   repository deletion.
 - Repository listing over SSH with `githost-list` and a best-effort
   `git ls-remote` hint on stderr.
-- A config repository, `server-access.git` by default, whose default branch is
-  materialized into `config_dir` and reloaded in process.
-
-Not implemented:
-
-- An HTTP Git endpoint. The backend is shared by design so an HTTP handler can
-  be added without loopback calls or OS accounts.
+- A config repository, `server-access.git` by default, whose main branch is
+  checked out as a worktree in `config_dir` and reloaded in process. Its
+  `users`, `admins`, and `<org>.access` files are plain text files.
+- A read-only smart HTTP handler (`http.handlers.githost`) for clone and
+  fetch, sharing the app's users file, admins file, and org ACLs.
 
 ## Goals and boundaries
 
@@ -29,7 +27,7 @@ Reuse:
 
 - `crypto/ed25519` and `crypto/rand` for the SSH host key.
 - Caddy `ctx.Storage()` (`certmagic.Storage`) for the fallback host key.
-- A single in-process `Backend` that any future HTTP handler can share.
+- A single in-process `Backend` used by the SSH transport.
 - `golang.org/x/crypto/ssh` for key parsing, signatures, and transport types.
 - `github.com/gliderlabs/ssh` for the TCP server and session handling.
 - `github.com/go-git/go-git/v6` for the Git wire protocol, so the image needs
@@ -37,13 +35,17 @@ Reuse:
 
 Out of scope:
 
+- HTTP push. The HTTP handler serves read-only smart HTTP only.
 - Interactive shells, PTYs, port forwarding, agent forwarding, SFTP.
 - `/etc/ssh`, an OS `sshd`, or per-user OS accounts.
 - Fake refs as a repository listing.
 
 ## Module and configuration
 
-Module ID: `githost` (`caddy.Module`, `caddy.App`, `caddy.Provisioner`).
+Module IDs: `githost` for the app (`caddy.Module`, `caddy.App`,
+`caddy.Provisioner`) and `http.handlers.githost` for the read-only HTTP
+handler (`caddy.Module`, `caddy.Provisioner`, `caddyhttp.MiddlewareHandler`,
+`caddyfile.Unmarshaler`).
 
 Caddyfile global option:
 
@@ -71,6 +73,11 @@ Fields:
 
 Unknown subdirectives and extra arguments are rejected. There is no user list
 in Caddy config; identity and authorization live in files.
+
+The HTTP handler is a site directive named `githost` that takes no arguments.
+It is registered after `basic_auth` so an authenticator can populate
+`http.auth.user.id`. The handler reads that handle, normalizes it to
+`@<handle>`, and serves read-only smart HTTP against the app's access store.
 
 Defaults are applied before validation. `Provision` creates `repo_root` and
 `config_dir`, opens the access store, resolves the host key, and builds the
@@ -188,7 +195,7 @@ untouched or removes it completely. A later owner push recreates it empty.
 session route. Only handles listed in the current `admins` snapshot may read or
 push it. A missing repository is created on the first admin push.
 
-The default branch is the config tree. Every root entry must be `users`,
+The main branch is the config tree. Every root entry must be `users`,
 `admins`, or `<org>.access`; nested paths, non-regular files, unknown names,
 and deletion of the default branch are rejected. The push must update the
 default branch. The tree is parsed and validated before any ref moves.
@@ -198,10 +205,10 @@ Validation rejects a tree whose ACL references an unknown handle, whose
 pushing handle. A rejected push leaves the installed files and the live
 snapshot unchanged.
 
-On success, `users`, `admins`, and `*.access` are written to `config_dir` with
-temporary files and renames, any stale access file is removed, and the store
-swaps in the new snapshot. No `caddy reload` is needed. The config repository
-is not an org repository and never appears in listings.
+On success, the pushed tree is checked out into the worktree at `config_dir`,
+any stale access file is removed, and the store swaps in the new snapshot. No
+`caddy reload` is needed. The config repository is not an org repository and
+never appears in listings.
 
 ## SSH transport
 
@@ -226,6 +233,34 @@ Errors are written to stderr before exiting `1`; success exits `0`.
 Path safety rejects empty paths, traversal segments, backslashes, deeper
 nesting, and paths escaping `repo_root`.
 
+## HTTP transport
+
+The `http.handlers.githost` handler serves read-only smart HTTP.
+
+Authentication:
+
+- Read the authenticated handle from `http.auth.user.id`, set by `basic_auth`
+  or another authenticator. The handler normalizes it to `@<handle>`.
+- A request with no handle gets `401` with a `WWW-Authenticate: Basic`
+  challenge.
+- Resolve the handle against the same users snapshot as SSH. Unknown handles
+  are denied.
+
+Paths and services:
+
+- `GET <repo>/info/refs?service=git-upload-pack` serves the ref advertisement.
+  Any other `service` value, including `git-receive-pack`, is refused with
+  `403`.
+- `POST <repo>/git-upload-pack` serves the upload-pack RPC.
+- `<repo>/git-receive-pack` and `info/refs?service=git-receive-pack` are
+  refused with `403`; push is unavailable over HTTP.
+- Unsupported methods return `405`, unknown paths `404`, and unknown or
+  unreadable repositories follow the same role rules as SSH.
+
+Repository access uses the same `Snapshot` and role checks as SSH. The config
+repository is readable over HTTP only by admins. A request handle that cannot
+read the repository gets `403`.
+
 ## Host key
 
 The server presents one Ed25519 host key.
@@ -242,8 +277,8 @@ The secret is as sensitive as a private key. It must not be blank when set.
 ## Lifecycle
 
 1. `Provision`: apply defaults, validate, create `repo_root` and `config_dir`,
-   open the access store, resolve the host key, construct the backend and
-   server.
+   sync the config worktree, open the access store, resolve the host key,
+   construct the backend and server.
 2. `Start`: bind `net.Listen("tcp", listen_addr)` synchronously so bind and
    permission errors surface immediately, then serve in a tracked goroutine.
 3. `Stop`: close the SSH server and listener, then wait for session goroutines.
@@ -259,6 +294,8 @@ persists through storage or the configured secret.
 type Backend interface {
 	UploadPack(ctx context.Context, req Request, stdin io.Reader, stdout, stderr io.Writer) error
 	ReceivePack(ctx context.Context, req Request, stdin io.Reader, stdout, stderr io.Writer) error
+	UploadPackInfoRefs(ctx context.Context, req Request, stdout io.Writer) error
+	UploadPackHTTP(ctx context.Context, req Request, stdin io.Reader, stdout io.Writer) error
 }
 ```
 
@@ -272,7 +309,8 @@ The go-git implementation:
 - Takes a per-directory read lock for upload-pack and a write lock for
   receive-pack, so deletion and pushes do not overlap active sessions.
 - Enforces coder ref prefixes and owner-only deletion in pre-receive hooks.
-- Validates and applies config repository pushes through the same hooks.
+- Validates config repository pushes through the same hooks and syncs the
+  pushed tree into the `config_dir` worktree.
 
 ## Package layout
 
@@ -280,29 +318,11 @@ The go-git implementation:
 | --- | --- |
 | root `githost.go` | package clause and blank imports of `pkg/config` and `pkg/githost` |
 | `pkg/config` | `Config`, defaults, validation, global Caddyfile option |
-| `pkg/githost` | app module, provisioning, listener lifecycle |
+| `pkg/githost` | app module, provisioning, listener lifecycle, read-only HTTP handler |
 | `pkg/access` | users, admins, ACL parsing, snapshots, authentication, roles |
 | `pkg/repo` | path parsing, safety checks, bare repository creation and removal, listing |
 | `pkg/backend` | `Backend` interface, go-git adapter, locking, push policy, config tree |
 | `pkg/transport` | SSH server, host key, authentication, command dispatch, listing |
-
-## Future work
-
-### HTTP Git endpoint
-
-A future HTTP handler may share the same `Backend` and access snapshot. It
-must not call back through localhost HTTP and must not use OS accounts. Git
-smart HTTP routes would enforce the same role policy and repository rules as
-SSH. Until it exists, the SSH transport is the only Git transport.
-
-### `git ls-remote` listing hint
-
-The listing is written to the session stderr before `upload-pack` starts, so a
-client still waiting for the advertisement receives it and `git ls-remote`
-shows the readable repositories on stderr, before or after the refs. The write
-is best effort, its error is ignored, and its assertion tolerates an absent
-hint. It must never emit fake refs.
-
 ## Antipatterns
 
 - Trusting the SSH username or `s.User()` as identity. Map verified keys to
@@ -314,6 +334,5 @@ hint. It must never emit fake refs.
 - Storing or logging the `secret`.
 - Writing errors only to logs. Always write a readable message to stderr
   before an interactive failure, and exit non-zero.
-- Calling the backend over loopback HTTP from the SSH path.
 - Leaving the listener or server goroutines running on reload.
 - Publishing the container's `:22` onto a host port already used by `sshd`.

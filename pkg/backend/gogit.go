@@ -48,6 +48,45 @@ func (b *GoGit) UploadPack(ctx context.Context, req Request, stdin io.Reader, st
 		})
 }
 
+func (b *GoGit) UploadPackInfoRefs(ctx context.Context, req Request, stdout io.Writer) error {
+	st, err := openStore(req.Dir)
+	if err != nil {
+		return err
+	}
+
+	lock := b.repoLock(req.Dir)
+	lock.RLock()
+	defer lock.RUnlock()
+
+	return transport.UploadPack(ctx, st, nil,
+		ioutil.WriteNopCloser(stdout),
+		&transport.UploadPackRequest{
+			GitProtocol:   req.GitProtocol,
+			AdvertiseRefs: true,
+			StatelessRPC:  true,
+		})
+}
+
+func (b *GoGit) UploadPackHTTP(ctx context.Context, req Request, stdin io.Reader, stdout io.Writer) error {
+	st, err := openStore(req.Dir)
+	if err != nil {
+		return err
+	}
+
+	lock := b.repoLock(req.Dir)
+	lock.RLock()
+	defer lock.RUnlock()
+
+	return transport.UploadPack(ctx, st,
+		io.NopCloser(stdin),
+		ioutil.WriteNopCloser(stdout),
+		&transport.UploadPackRequest{
+			GitProtocol:   req.GitProtocol,
+			AdvertiseRefs: false,
+			StatelessRPC:  true,
+		})
+}
+
 func (b *GoGit) ReceivePack(ctx context.Context, req Request, stdin io.Reader, stdout, _ io.Writer) error {
 	st, err := openStore(req.Dir)
 	if err != nil {
@@ -59,8 +98,7 @@ func (b *GoGit) ReceivePack(ctx context.Context, req Request, stdin io.Reader, s
 	defer lock.Unlock()
 
 	var deleteRepo bool
-	var adminFiles map[string][]byte
-	var adminApplyErr error
+	var adminSyncErr error
 	err = transport.ReceivePack(ctx, st,
 		io.NopCloser(stdin),
 		ioutil.WriteNopCloser(stdout),
@@ -75,11 +113,7 @@ func (b *GoGit) ReceivePack(ctx context.Context, req Request, stdin io.Reader, s
 						if err != nil {
 							return err
 						}
-						if err := validateAdminPush(req, files); err != nil {
-							return err
-						}
-						adminFiles = files
-						return nil
+						return validateAdminPush(req, files)
 					}
 
 					if err := checkPushPolicy(req, info); err != nil {
@@ -94,19 +128,23 @@ func (b *GoGit) ReceivePack(ctx context.Context, req Request, stdin io.Reader, s
 						return nil
 					}
 					if req.Access == nil {
-						adminApplyErr = fmt.Errorf("config repository: access store is not configured")
-						return adminApplyErr
+						adminSyncErr = fmt.Errorf("config repository: access store is not configured")
+						return adminSyncErr
 					}
-					adminApplyErr = req.Access.Apply(adminFiles)
-					return adminApplyErr
+					if err := SyncWorktree(req.Dir, req.ConfigDir); err != nil {
+						adminSyncErr = err
+						return err
+					}
+					adminSyncErr = req.Access.Reload()
+					return adminSyncErr
 				},
 			},
 		})
 	if err != nil {
 		return err
 	}
-	if adminApplyErr != nil {
-		return adminApplyErr
+	if adminSyncErr != nil {
+		return adminSyncErr
 	}
 	if deleteRepo {
 		return repo.RemoveBare(req.Root, req.Dir)

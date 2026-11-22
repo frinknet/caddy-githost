@@ -11,5 +11,11 @@
 }
 
 :8080 {
-	respond "githost e2e" 200
+	basic_auth {
+		alice $2a$14$rK.kRC/LtNfrjV/xngG06ehOY/wbJCai5nHsJBcWJpmwF3IXUgp5y
+		bob $2a$14$rK.kRC/LtNfrjV/xngG06ehOY/wbJCai5nHsJBcWJpmwF3IXUgp5y
+		carol $2a$14$rK.kRC/LtNfrjV/xngG06ehOY/wbJCai5nHsJBcWJpmwF3IXUgp5y
+		mallory $2a$14$rK.kRC/LtNfrjV/xngG06ehOY/wbJCai5nHsJBcWJpmwF3IXUgp5y
+	}
+	githost
 }

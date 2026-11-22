@@ -38,6 +38,18 @@ func (f *fakeBackend) ReceivePack(_ context.Context, req backend.Request, _ io.R
 	return err
 }
 
+func (f *fakeBackend) UploadPackInfoRefs(_ context.Context, req backend.Request, stdout io.Writer) error {
+	f.record(req)
+	_, err := io.WriteString(stdout, "info-refs-ok")
+	return err
+}
+
+func (f *fakeBackend) UploadPackHTTP(_ context.Context, req backend.Request, _ io.Reader, stdout io.Writer) error {
+	f.record(req)
+	_, err := io.WriteString(stdout, "upload-http-ok")
+	return err
+}
+
 func (f *fakeBackend) record(req backend.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

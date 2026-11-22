@@ -3,6 +3,8 @@ package backend
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -10,11 +12,14 @@ import (
 
 	"github.com/frinknet/caddy-githost/pkg/access"
 	"github.com/frinknet/caddy-githost/pkg/repo"
+	"github.com/go-git/go-billy/v6/osfs"
 	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/cache"
 	"github.com/go-git/go-git/v6/plumbing/filemode"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/transport"
+	"github.com/go-git/go-git/v6/storage/filesystem"
 	"github.com/go-git/go-git/v6/storage/memory"
 	gossh "golang.org/x/crypto/ssh"
 )
@@ -264,5 +269,88 @@ func TestValidateAdminPush(t *testing.T) {
 	files["admins"] = []byte("@bob\n")
 	if err := validateAdminPush(req, files); err == nil {
 		t.Error("push removing the pushing admin should be rejected")
+	}
+}
+
+func TestSyncWorktree(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "config.git")
+	if err := repo.CreateBare(repoDir); err != nil {
+		t.Fatal(err)
+	}
+	st := filesystem.NewStorage(osfs.New(repoDir), cache.NewObjectLRUDefault())
+
+	blob := st.NewEncodedObject()
+	blob.SetType(plumbing.BlobObject)
+	w, err := blob.Writer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("users\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	blobHash, err := st.SetEncodedObject(blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tree := &object.Tree{Entries: []object.TreeEntry{{Name: "users", Mode: filemode.Regular, Hash: blobHash}}}
+	treeObj := st.NewEncodedObject()
+	if err := tree.Encode(treeObj); err != nil {
+		t.Fatal(err)
+	}
+	treeHash, err := st.SetEncodedObject(treeObj)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sig := object.Signature{Name: "test", Email: "test@example.com", When: time.Unix(0, 0)}
+	commit := &object.Commit{Author: sig, Committer: sig, Message: "init", TreeHash: treeHash}
+	commitObj := st.NewEncodedObject()
+	if err := commit.Encode(commitObj); err != nil {
+		t.Fatal(err)
+	}
+	commitHash, err := st.SetEncodedObject(commitObj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetReference(plumbing.NewHashReference(plumbing.NewBranchReferenceName("main"), commitHash)); err != nil {
+		t.Fatal(err)
+	}
+
+	configDir := filepath.Join(root, "config")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "stale.access"), []byte("stale\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := SyncWorktree(repoDir, configDir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(configDir, "users"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "users\n" {
+		t.Fatalf("users = %q", data)
+	}
+	gitFile, err := os.ReadFile(filepath.Join(configDir, ".git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(gitFile), "gitdir: "+repoDir) {
+		t.Fatalf(".git = %q", gitFile)
+	}
+	if _, err := os.Stat(filepath.Join(configDir, "stale.access")); !os.IsNotExist(err) {
+		t.Fatalf("stale.access should have been removed, err = %v", err)
+	}
+
+	if err := SyncWorktree(filepath.Join(root, "missing.git"), filepath.Join(root, "missing")); err != nil {
+		t.Fatal(err)
 	}
 }

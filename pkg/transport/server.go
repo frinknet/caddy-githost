@@ -26,6 +26,7 @@ type Options struct {
 	ListenAddr string
 	RepoRoot   string
 	ConfigRepo string
+	ConfigDir  string
 	Store      *access.Store
 	Backend    backend.Backend
 	HostKey    gossh.Signer
@@ -36,6 +37,7 @@ type Server struct {
 	addr       string
 	repoRoot   string
 	configRepo string
+	configDir  string
 	store      *access.Store
 	backend    backend.Backend
 	logger     *zap.Logger
@@ -53,6 +55,7 @@ func NewServer(opts Options) *Server {
 		addr:       opts.ListenAddr,
 		repoRoot:   opts.RepoRoot,
 		configRepo: configRepo,
+		configDir:  opts.ConfigDir,
 		store:      opts.Store,
 		backend:    opts.Backend,
 		logger:     opts.Logger,
@@ -207,6 +210,7 @@ func (s *Server) handleAdmin(sess ssh.Session, handle string, act action) {
 	req := backend.Request{
 		Root:        s.repoRoot,
 		Dir:         dir,
+		ConfigDir:   s.configDir,
 		Handle:      handle,
 		GitProtocol: gitProtocolEnv(sess.Environ()),
 		Admin:       true,

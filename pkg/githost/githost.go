@@ -2,6 +2,7 @@ package githost
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
@@ -21,7 +22,9 @@ func init() {
 
 type GitHost struct {
 	config.Config
-	server *transport.Server
+	server  *transport.Server
+	store   *access.Store
+	backend backend.Backend
 }
 
 func (GitHost) CaddyModule() caddy.ModuleInfo {
@@ -42,11 +45,16 @@ func (g *GitHost) Provision(ctx caddy.Context) error {
 	if err := os.MkdirAll(g.ConfigDir, 0o755); err != nil {
 		return err
 	}
+	if err := backend.SyncWorktree(filepath.Join(g.RepoRoot, g.ConfigRepo), g.ConfigDir); err != nil {
+		return err
+	}
 
 	store, err := access.Open(g.ConfigDir)
 	if err != nil {
 		return err
 	}
+	g.store = store
+	g.backend = backend.New()
 	var hostKey gossh.Signer
 	if secret := strings.TrimSpace(g.Secret); secret != "" {
 		hostKey, err = transport.HostKeyFromPhrase(secret)
@@ -61,8 +69,9 @@ func (g *GitHost) Provision(ctx caddy.Context) error {
 		ListenAddr: g.ListenAddr,
 		RepoRoot:   g.RepoRoot,
 		ConfigRepo: g.ConfigRepo,
-		Store:      store,
-		Backend:    backend.New(),
+		ConfigDir:  g.ConfigDir,
+		Store:      g.store,
+		Backend:    g.backend,
 		HostKey:    hostKey,
 		Logger:     ctx.Logger(),
 	})

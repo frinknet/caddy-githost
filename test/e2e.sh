@@ -1,11 +1,13 @@
 #!/bin/sh
 # e2e test runner: starts caddy-githost:test with the fixture Caddyfile,
-# publishes the SSH port, and exercises clone, fetch, and push over SSH.
+# publishes the SSH and HTTP ports, and exercises clone, fetch, and push over
+# SSH plus read-only clone over HTTP.
 
 set -eu
 
 IMAGE=caddy-githost:test
 PORT=${E2E_SSH_PORT:-2222}
+HTTP_PORT=${E2E_HTTP_PORT:-8081}
 FIXTURES=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/e2e/fixtures
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 WORK=$(mktemp -d)
@@ -83,6 +85,7 @@ printf '@alice\n' >"$WORK/config/admins"
 CID=$(timeout 60s docker run -d \
 	-u "$(id -u):$(id -g)" \
 	-p "127.0.0.1:$PORT:2222" \
+	-p "127.0.0.1:$HTTP_PORT:8080" \
 	-v "$FIXTURES/Caddyfile:/etc/caddy/Caddyfile:ro" \
 	-v "$WORK:/srv/git" \
 	-v "$WORK/config:/srv/config" \
@@ -109,7 +112,22 @@ wait_for_ssh() {
 	return 1
 }
 
-if ! wait_for_ssh; then
+HTTP_URL="http://127.0.0.1:$HTTP_PORT/acme/app.git"
+HTTP_AUTH="alice:e2e-http-pass"
+
+wait_for_http() {
+	tries=0
+	while [ "$tries" -lt 30 ]; do
+		if timeout 5s git ls-remote "http://$HTTP_AUTH@127.0.0.1:$HTTP_PORT/acme/app.git" >/dev/null 2>&1; then
+			return 0
+		fi
+		tries=$((tries + 1))
+		sleep 1
+	done
+	return 1
+}
+
+if ! wait_for_ssh || ! wait_for_http; then
 	printf 'e2e: SSH endpoint did not become ready\n' >&2
 	timeout 5s git ls-remote "$URL" 2>&1 || true
 	timeout 5s ssh -vv -i "$WORK/id_alice" $SSH_OPTS -p "$PORT" git@127.0.0.1 "git-upload-pack 'acme/app.git'" 2>&1 | tail -20 || true
@@ -206,6 +224,9 @@ fi
 GIT_SSH_COMMAND="$(ssh_for "$WORK/id_alice")" timeout 60s \
 	git -C "$WORK/admin" push -q "$ADMIN_URL" HEAD:refs/heads/main
 [ -d "$WORK/githost-config.git" ] || fail "config_repo path was not created"
+[ -f "$WORK/config/.git" ] || fail "config dir is not a worktree"
+grep -q "gitdir: /srv/git/githost-config.git" "$WORK/config/.git" ||
+	fail "config worktree does not point to the config repository"
 
 printf '@alice owner\n@bob owner\n@carol coder\n@mallory block\n' >"$WORK/admin/acme.access"
 printf '@alice\n@bob\n' >"$WORK/admin/admins"
@@ -241,6 +262,25 @@ if GIT_SSH_COMMAND="$(ssh_for "$WORK/id_alice")" timeout 60s \
 	fail "push removing the pushing admin was accepted"
 fi
 grep -q '@alice' "$WORK/config/admins" || fail "admin lockout was installed"
+
+timeout 60s git clone -q "http://$HTTP_AUTH@127.0.0.1:$HTTP_PORT/acme/app.git" "$WORK/http-clone" ||
+	fail "HTTP clone failed"
+grep -q 'push from owner' "$WORK/http-clone/README" || fail "HTTP clone content mismatch"
+
+printf 'http push\n' >>"$WORK/http-clone/README"
+git -C "$WORK/http-clone" add README
+git -C "$WORK/http-clone" -c user.name=e2e -c user.email=e2e@example.com commit -qm http-push
+if timeout 60s git -C "$WORK/http-clone" push -q "http://$HTTP_AUTH@127.0.0.1:$HTTP_PORT/acme/app.git" HEAD:refs/heads/main 2>/dev/null; then
+	fail "HTTP push succeeded"
+fi
+
+if timeout 60s git clone -q "http://mallory:e2e-http-pass@127.0.0.1:$HTTP_PORT/acme/app.git" "$WORK/http-mallory" 2>/dev/null; then
+	fail "blocked handle cloned over HTTP"
+fi
+
+if GIT_TERMINAL_PROMPT=0 timeout 60s git clone -q "http://nobody:e2e-http-pass@127.0.0.1:$HTTP_PORT/acme/app.git" "$WORK/http-nobody" 2>/dev/null; then
+	fail "unknown user cloned over HTTP"
+fi
 
 if GIT_SSH_COMMAND="$(ssh_for "$WORK/id_alice")" timeout 60s \
 	git -C "$WORK/clone" push -q origin :refs/heads/main 2>"$WORK/delete.out"; then

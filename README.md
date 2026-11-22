@@ -1,23 +1,32 @@
 # caddy-githost
 
-SSH Git server packaged as a Caddy v2 app. `spec.md` is the target design;
-this file describes only what exists in the tree today.
+SSH and read-only HTTP Git server packaged as a Caddy v2 app. `spec.md` is the
+target design; this file describes only what exists in the tree today.
 
 ## Status
 
-Core server works. Caddy starts an SSH listener, authenticates public keys
-against a users file, authorizes per-org ACLs, and serves clone, fetch, and
-push with an in-process Git implementation. Repositories are bare directories
-under `repo_root`; the users file and org ACLs live in `config_dir`.
+Core server works. Caddy starts an SSH listener and an optional read-only HTTP
+handler, authenticates public keys against a users file, authorizes per-org
+ACLs, and serves clone and fetch with an in-process Git implementation. Push
+is available over SSH only. Repositories are bare directories under
+`repo_root`; the users file and org ACLs are plain text files in a git
+worktree of the config repository's main branch, checked out at `config_dir`.
 
-- Module ID: `githost` (a Caddy app, not an HTTP handler).
+- Module IDs: `githost` (Caddy app) and `http.handlers.githost` (HTTP handler).
 - Caddyfile global option: `githost { ... }` with `listen_addr`, `repo_root`,
   `config_dir`, `config_repo`, and `secret`. Unknown subdirectives and extra
   arguments are rejected.
+- Caddyfile site directive: `githost` with no arguments, registered after
+  `basic_auth`. It serves read-only smart HTTP (`info/refs` and
+  `git-upload-pack`) for the same repositories and ACLs as SSH. Push is
+  refused with `403`; `git-receive-pack` and `service=git-receive-pack` are
+  never served.
 - `git-upload-pack '<org>/<name>.git'`, `git-receive-pack '<org>/<name>.git'`,
   and `githost-list` are accepted; a session with no command (and no PTY)
-  prints the same listing. Shells, PTYs, port forwarding, agent forwarding,
-  and SFTP are denied.
+  prints the same listing. PTY requests are denied; a shell request without
+  a PTY is treated as a listing request. Port forwarding, agent forwarding,
+  and SFTP are not supported. The SSH username is ignored; the public key
+  identifies the user.
 - Before `upload-pack` starts, the readable repository listing is written to
   the session's stderr as a best-effort hint, so `git clone` and `git fetch`
   show it as remote output and `git ls-remote` prints it when the client has
@@ -30,9 +39,6 @@ under `repo_root`; the users file and org ACLs live in `config_dir`.
   needs no external `git` binary.
 - `sh test/unit.sh` and `./test/e2e.sh` pass.
 
-Not implemented yet: an HTTP Git endpoint. See `BACKLOG.md` (local,
-.git-ignored).
-
 ## Configuration
 
 Caddyfile:
@@ -41,8 +47,8 @@ Caddyfile:
 {
 	githost {
 		listen_addr :22
-		repo_root /var/lib/githost/repos
-		config_dir /var/caddy/config
+		repo_root /var/lib/caddy/git
+		config_dir /etc/caddy/githost
 		config_repo server-access.git
 		secret "correct horse battery staple"
 	}
@@ -51,6 +57,22 @@ Caddyfile:
 :80 {
 	root * /srv/www
 	file_server
+}
+```
+
+Equivalent JSON:
+
+```json
+{
+  "apps": {
+    "githost": {
+      "listen_addr": ":22",
+      "repo_root": "/var/lib/caddy/git",
+      "config_dir": "/etc/caddy/githost",
+      "config_repo": "server-access.git",
+      "secret": "correct horse battery staple"
+    }
+  }
 }
 ```
 
@@ -68,8 +90,38 @@ in Caddy storage instead.
 tree. It defaults to `server-access.git`, must be a single path component, and
 may omit the `.git` suffix. Admins reach it as `ssh://git@host/<config_repo>`.
 
-The JSON module ID is `githost`, with fields `listen_addr`, `repo_root`,
-`config_dir`, `config_repo`, and `secret`. There is no user list in JSON;
+### HTTP handler
+
+The HTTP handler is opt-in. Add the `githost` directive to a site block and
+authenticate the request first, for example with `basic_auth`:
+
+```caddyfile
+:8080 {
+	basic_auth {
+		alice $2a$14$8s4Bif0TU7lJWntt5Y6GWuLYSJ3xMoiLEBzd35rVV4ztbhwpLSbka
+	}
+	githost
+}
+```
+
+The directive takes no arguments. It reads the authenticated handle from
+`http.auth.user.id`, which `basic_auth` (or another authenticator) sets, and
+normalizes it to `@<handle>`. A request with no handle gets `401`. The handler
+shares the app's users file, admins file, and org ACLs, so an HTTP clone uses
+the same read rules as SSH. The config repository is readable over HTTP only
+by admins.
+
+Only read-only smart HTTP is served: `GET .../info/refs?service=git-upload-pack`
+and `POST .../git-upload-pack`. `git-receive-pack` and
+`service=git-receive-pack` return `403`, so push is unavailable over HTTP.
+
+```sh
+git clone http://alice:password@host:8080/acme/app.git
+```
+
+The JSON module ID is `githost` for the app and `http.handlers.githost` for the
+handler. The app takes `listen_addr`, `repo_root`, `config_dir`, `config_repo`,
+and `secret`; the handler takes no fields. There is no user list in JSON;
 access lives in files.
 
 ### Users file
@@ -119,27 +171,31 @@ Unknown handles, unknown roles, and duplicate entries are load errors. A
 missing or empty ACL file denies every repo in that org.
 
 Access files are loaded during `Provision`, fail closed, and are not watched.
-Edit them and run `caddy reload` for changes to take effect, or push them to
-the config repository.
+Change them by pushing to the config repository; the worktree and in-memory
+snapshot update without a reload. Before the config repository exists, create
+the files directly and run `caddy reload`.
 
 ### Config repository
 
 Handles listed in `admins` may read and push the top-level bare repository
-`<repo_root>/<config_repo>`. A push to its default branch is the config
+`<repo_root>/<config_repo>`, `server-access.git` by default. `config_dir` is a
+git worktree of its main branch: `users`, `admins`, and `<org>.access` are
+plain text files checked out there. A push to the main branch is the config
 tree: every root file must be `users`, `admins`, or `<org>.access`, and the
 whole pushed tree is validated before any ref moves. A malformed push, a
 nested path, a deletion of the default branch, or an `admins` file that drops
 the pushing handle is rejected and the installed files stay untouched.
 
-On success the pushed tree replaces `users`, `admins`, and `*.access` in
-`config_dir` and reloads the in-memory ACL snapshot, with no `caddy reload`
-needed. Any `users`, `admins`, or `*.access` file not in the pushed tree is
-removed from `config_dir`. Only handles in the current `admins` file can push
-or clone this repository; a missing repository is created on the first admin
-push.
+On success the pushed tree is checked out into the worktree at `config_dir`
+and the in-memory ACL snapshot is reloaded, with no `caddy reload` needed. Any
+`users`, `admins`, or `*.access` file not in the pushed tree is removed from
+`config_dir`. Only handles in the current `admins` file can push or clone this
+repository; a missing repository is created on the first admin push.
 
 ```sh
 # locally, in a clone of the config repository
+git clone ssh://git@host/server-access.git
+cd server-access
 git add users admins acme.access
 git commit -m 'grant bob owner and admin'
 git push origin HEAD:refs/heads/main
@@ -155,6 +211,26 @@ repository and cannot be addressed this way.
 
 An `owner` pushing to a missing repo creates a bare repo with `HEAD` pointing
 at `refs/heads/main`. Other roles cannot create repos.
+
+### Cloning and pushing
+
+```sh
+git clone ssh://git@host/acme/app.git
+cd app
+git push origin HEAD:refs/heads/main
+```
+
+The SSH username is ignored; the public key identifies the user. Use the same
+URL form for `git fetch`, `git ls-remote`, and `git push`.
+
+Over HTTP, use the same repository path under the handler's site address:
+
+```sh
+git clone http://alice:password@host:8080/acme/app.git
+git fetch http://alice:password@host:8080/acme/app.git
+```
+
+HTTP serves clone and fetch only. `git push` over HTTP is refused with `403`.
 
 ### Listing repositories
 
@@ -213,8 +289,12 @@ connection:
 2. Create `<config_dir>/<org>.access` with that handle as `owner`.
 3. Create `<config_dir>/admins` with that handle so it can push the config
    repository.
-4. Create the bare repo, or let the first owner push create it.
+4. Create the bare repo, or let the first admin push create it.
 5. Run `caddy reload` after adding files to a running server.
+
+The first admin push creates the config repository and turns `config_dir`
+into a worktree of its main branch. From then on, change the text files by
+pushing to the repository, not by editing the worktree directly.
 
 No users file means no authentication; no org ACL means every repo in that
 org is denied.
@@ -225,14 +305,14 @@ org is denied.
 | --- | --- |
 | `githost.go` | Root Go file. Holds the `package` clause and blank imports of `pkg/config` and `pkg/githost`. |
 | `pkg/config/` | `Config` struct, defaults, validation, and the `githost` Caddyfile global option parser. |
-| `pkg/githost/` | `GitHost` app module: module registration, provisioning, listener lifecycle. |
+| `pkg/githost/` | `GitHost` app module (provisioning, listener lifecycle) and the read-only smart HTTP handler. |
 | `pkg/access/` | Users file parsing, org ACL parsing, immutable access snapshots, key authentication, role resolution. |
 | `pkg/repo/` | Repo path parsing and safety checks, bare repo creation, repo listing over the filesystem. |
 | `pkg/backend/` | `Backend` interface, go-git server adapter, per-repo locking, push policy, config-repository tree validation. |
 | `pkg/transport/` | SSH server, host key persistence, public-key auth, command allowlist, session dispatch, repository listing, admin repository routing. |
 | `www/Caddyfile` | Shipped Caddyfile, copied to `/srv/www` in the image. Serves `/srv/www` on `:80` and starts `githost` on `:22`. |
 | `test/unit.sh` | Canonical unit layer: one bounded builder container running `gofmt -l . && go vet ./... && go test -timeout=120s ./...`. |
-| `test/e2e.sh` | Canonical e2e layer: starts `caddy-githost:test`, seeds a bare repo and access files in the config dir, then runs clone, push, admin ACL push, and denial checks over SSH. |
+| `test/e2e.sh` | Canonical e2e layer: starts `caddy-githost:test`, seeds a bare repo and access files in the config dir, then runs clone, push, admin ACL push, and denial checks over SSH and read-only HTTP. |
 | `test/e2e/fixtures/` | Fixture Caddyfile mounted into the e2e container. |
 | `build.sh` | Builds `caddy-githost:test` from the `NOTICE` slug. |
 | `Dockerfile` | Three stages: fetch toybox/certs/tzdata, build with `xcaddy`, compose a scratch image. |
@@ -286,7 +366,10 @@ root, a temporary config dir, and Caddy data/cache directories, then asserts:
   unchanged;
 - deleting the default branch without `-o confirm-delete` is refused with the
   retry command in the error, leaves the repo and branch intact, and the
-  confirmed push removes the repo while a sibling repo survives.
+  confirmed push removes the repo while a sibling repo survives;
+- over HTTP, an authenticated clone returns the seeded bytes, a push is
+  refused with `403`, a blocked handle cannot read, and an unknown user is
+  denied by `basic_auth`.
 
 It also checks that the image's Caddy version matches `go.mod`, that the
 shipped `www/Caddyfile` validates, and that deliberately broken Caddyfiles
